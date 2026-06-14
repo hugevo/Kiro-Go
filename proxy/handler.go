@@ -9,6 +9,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,8 @@ type Handler struct {
 	tokenRefreshMu  sync.Mutex
 	// 会话粘性：apiKeyID → accountID
 	sessionAffinity sync.Map
+	// 请求日志
+	requestLogs *LogStore
 }
 
 type thinkingStreamSource int
@@ -227,6 +230,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		requestLogs:     NewLogStore(defaultMaxLogs),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -828,6 +832,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+	startTime := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1207,6 +1212,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailure()
+			h.recordRequestLog("/v1/messages", model, 500, 0, 0, 0, 0, 0, time.Since(startTime).Milliseconds(), apiKeyID)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1239,6 +1245,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		h.recordRequestLog("/v1/messages", model, 200, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits, time.Since(startTime).Milliseconds(), apiKeyID)
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1266,6 +1273,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	h.recordFailure()
+	h.recordRequestLog("/v1/messages", model, 500, 0, 0, 0, 0, 0, time.Since(startTime).Milliseconds(), apiKeyID)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1376,6 +1384,7 @@ func (h *Handler) getAffinityAccount(apiKeyID, model string, excluded map[string
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+	startTime := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1452,6 +1461,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		h.recordRequestLog("/v1/messages", model, 200, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits, time.Since(startTime).Milliseconds(), apiKeyID)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1492,6 +1502,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	h.recordFailure()
+	h.recordRequestLog("/v1/messages", model, 500, 0, 0, 0, 0, 0, time.Since(startTime).Milliseconds(), apiKeyID)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1548,6 +1559,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 // handleOpenAIStream OpenAI 流式响应
 func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+	startTime := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1868,6 +1880,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailure()
+			h.recordRequestLog("/v1/chat/completions", model, 500, 0, 0, 0, 0, 0, time.Since(startTime).Milliseconds(), apiKeyID)
 			return
 		}
 
@@ -1898,6 +1911,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.recordRequestLog("/v1/chat/completions", model, 200, inputTokens, outputTokens, 0, 0, credits, time.Since(startTime).Milliseconds(), apiKeyID)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -1933,11 +1947,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	h.recordFailure()
+	h.recordRequestLog("/v1/chat/completions", model, 500, 0, 0, 0, 0, 0, time.Since(startTime).Milliseconds(), apiKeyID)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+	startTime := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -2002,6 +2018,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.recordRequestLog("/v1/chat/completions", model, 200, inputTokens, outputTokens, 0, 0, credits, time.Since(startTime).Milliseconds(), apiKeyID)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2016,6 +2033,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	h.recordFailure()
+	h.recordRequestLog("/v1/chat/completions", model, 500, 0, 0, 0, 0, 0, time.Since(startTime).Milliseconds(), apiKeyID)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2191,6 +2209,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "DELETE":
 		h.apiDeleteApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
+	case path == "/logs" && r.Method == "GET":
+		h.apiGetLogs(w, r)
+	case path == "/logs/stats" && r.Method == "GET":
+		h.apiGetLogStats(w, r)
+	case path == "/logs" && r.Method == "DELETE":
+		h.apiClearLogs(w, r)
 	default:
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Not Found"})
@@ -3652,4 +3676,61 @@ func clampInt(v, min, max int) int {
 		return max
 	}
 	return v
+}
+
+// ==================== 请求日志 API ====================
+
+func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+	filter := r.URL.Query().Get("apiKey")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 {
+			limit = v
+		}
+	}
+
+	var logs []RequestLog
+	if filter != "" {
+		logs = h.requestLogs.GetFiltered(filter, limit)
+	} else {
+		logs = h.requestLogs.GetLast(limit)
+	}
+
+	if logs == nil {
+		logs = []RequestLog{}
+	}
+	json.NewEncoder(w).Encode(logs)
+}
+
+func (h *Handler) apiGetLogStats(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(h.requestLogs.Stats())
+}
+
+func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
+	h.requestLogs.Clear()
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// recordRequestLog records a completed request to the log store.
+func (h *Handler) recordRequestLog(path, model string, status int, inputTokens, outputTokens, cacheRead, cacheWrite int, credits float64, latencyMs int64, apiKeyID string) {
+	name := ""
+	if apiKeyID != "" {
+		if entry := config.GetApiKeyEntry(apiKeyID); entry != nil {
+			name = entry.Name
+		}
+	}
+	h.requestLogs.Add(RequestLog{
+		Path:         path,
+		Model:        model,
+		Status:       status,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		CacheRead:    cacheRead,
+		CacheWrite:   cacheWrite,
+		Credits:      credits,
+		LatencyMs:    latencyMs,
+		ApiKeyID:     apiKeyID,
+		ApiKeyName:   name,
+	})
 }
