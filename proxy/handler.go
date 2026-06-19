@@ -2227,6 +2227,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetSettings(w, r)
 	case path == "/settings" && r.Method == "POST":
 		h.apiUpdateSettings(w, r)
+	case path == "/pool/status" && r.Method == "GET":
+		h.apiPoolStatus(w, r)
+	case path == "/cache/stats" && r.Method == "GET":
+		h.apiCacheStats(w, r)
+	case path == "/cache/sync" && r.Method == "POST":
+		h.apiCacheSync(w, r)
+	case path == "/cache/clear" && r.Method == "POST":
+		h.apiCacheClear(w, r)
 	case path == "/stats" && r.Method == "GET":
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
@@ -3859,4 +3867,45 @@ func clampInt(v, min, max int) int {
 		return max
 	}
 	return v
+}
+
+// GetPromptCache returns the prompt cache tracker (for L2 loading on startup).
+func (h *Handler) GetPromptCache() *promptCacheTracker {
+	return h.promptCache
+}
+
+// apiPoolStatus returns runtime pool state for the admin panel.
+func (h *Handler) apiPoolStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"states":         h.pool.GetStatus(),
+		"queueDepth":     h.pool.QueueDepth(),
+		"maxConcurrent":  h.pool.MaxConcurrent(),
+		"totalAccounts":  h.pool.Count(),
+		"availableCount": h.pool.AvailableCount(),
+	})
+}
+
+// apiCacheStats returns runtime cache statistics for the admin panel.
+func (h *Handler) apiCacheStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.promptCache.Stats())
+}
+
+// apiCacheSync forces an L1->L2 cache sync to disk.
+func (h *Handler) apiCacheSync(w http.ResponseWriter, r *http.Request) {
+	if err := h.promptCache.SaveToDisk("data/prompt_cache.json"); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiCacheClear flushes all cached entries.
+func (h *Handler) apiCacheClear(w http.ResponseWriter, r *http.Request) {
+	h.promptCache.Clear()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }

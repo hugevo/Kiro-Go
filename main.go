@@ -57,6 +57,22 @@ func main() {
 	// 创建 HTTP 处理器（包含后台刷新任务）
 	handler := proxy.NewHandler()
 
+	// Load prompt cache from disk (L2 tier)
+	if err := handler.GetPromptCache().LoadFromDisk("data/prompt_cache.json"); err != nil {
+		logger.Warnf("Failed to load prompt cache from disk: %v", err)
+	}
+
+	// Periodic L1->L2 cache sync (every 30 seconds)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := handler.GetPromptCache().SaveToDisk("data/prompt_cache.json"); err != nil {
+				logger.Debugf("prompt cache sync: %v", err)
+			}
+		}
+	}()
+
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
 	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))

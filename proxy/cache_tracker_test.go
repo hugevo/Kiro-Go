@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -260,5 +261,84 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	result := tracker.Compute("acct-1", profile2)
 	if result.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
+	}
+}
+
+func TestCrossAccountCacheHit(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	// Must be > 1024 tokens to be cacheable (min threshold)
+	longSystem := strings.Repeat("You are a Go expert. ", 200)
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": longSystem,
+				"cache_control": map[string]interface{}{"type": "ephemeral"},
+			},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "help"}},
+	}
+	profile := tracker.BuildClaudeProfile(req, 2048)
+	if profile == nil {
+		t.Fatal("expected profile")
+	}
+
+	// Account A creates cache
+	first := tracker.Compute("acct-a", profile)
+	if first.CacheCreationInputTokens <= 0 {
+		t.Fatalf("expected acct-a to create cache tokens, got %+v", first)
+	}
+	tracker.Update("acct-a", profile)
+
+	// Account B reads cache created by A (cross-account hit)
+	second := tracker.Compute("acct-b", profile)
+	if second.CacheReadInputTokens <= 0 {
+		t.Fatalf("expected acct-b to read cache tokens created by acct-a (cross-account), got %+v", second)
+	}
+	if second.CacheCreationInputTokens != 0 {
+		t.Fatalf("expected zero creation on cross-account hit")
+	}
+}
+
+func TestLRUEviction(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	tracker.maxEntries = 5
+
+	for i := 0; i < 10; i++ {
+		sys := fmt.Sprintf("prompt-%d-%s", i, strings.Repeat("x", 5000))
+		req := &ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			System: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": sys,
+					"cache_control": map[string]interface{}{"type": "ephemeral"},
+				},
+			},
+			Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+		}
+		profile := tracker.BuildClaudeProfile(req, 2048)
+		tracker.Update(fmt.Sprintf("acct-%d", i), profile)
+	}
+
+	count := tracker.EntryCount()
+	t.Logf("entries=%d evictions=%d", count, tracker.lruEvictions)
+	if count > 5 {
+		t.Fatalf("expected <= 5 entries after LRU eviction, got %d", count)
+	}
+	if tracker.lruEvictions == 0 {
+		t.Fatal("expected some LRU evictions")
+	}
+}
+
+func TestCacheStats(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	stats := tracker.Stats()
+	if v, ok := stats["l1_entries"]; !ok || v.(int) != 0 {
+		t.Fatalf("expected l1_entries=0, got %v", v)
+	}
+	if v, ok := stats["hit_rate"]; !ok || v.(float64) != 0.0 {
+		t.Fatalf("expected hit_rate=0, got %v", v)
 	}
 }
