@@ -756,6 +756,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	body = maybeCompressRequestBody(body)
 
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -798,6 +799,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	body = maybeCompressRequestBody(body)
 
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1530,6 +1532,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	body = maybeCompressRequestBody(body)
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
