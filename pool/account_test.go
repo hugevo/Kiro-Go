@@ -9,11 +9,9 @@ import (
 )
 
 func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
-	p := &AccountPool{}
-	normal := config.Account{ID: "normal"}
-	overLimit := config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10}
-
-	p.accounts = []config.Account{normal, overLimit}
+	normal := config.Account{ID: "normal", Enabled: true}
+	overLimit := config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10, Enabled: true}
+	p := newTestPool(normal, overLimit)
 
 	for i := 0; i < 5; i++ {
 		acc := p.GetNext()
@@ -27,15 +25,14 @@ func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
 }
 
 func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) {
-	p := &AccountPool{}
 	overLimit := config.Account{
 		ID:            "over",
 		UsageCurrent:  10,
 		UsageLimit:    10,
 		OverageStatus: "ENABLED",
+		Enabled:       true,
 	}
-
-	p.accounts = []config.Account{overLimit}
+	p := newTestPool(overLimit)
 
 	acc := p.GetNext()
 	if acc == nil {
@@ -47,15 +44,14 @@ func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) 
 }
 
 func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T) {
-	p := &AccountPool{}
 	overLimit := config.Account{
 		ID:            "over",
 		UsageCurrent:  10,
 		UsageLimit:    10,
 		OverageStatus: "DISABLED",
+		Enabled:       true,
 	}
-
-	p.accounts = []config.Account{overLimit}
+	p := newTestPool(overLimit)
 
 	if acc := p.GetNext(); acc != nil {
 		t.Fatalf("expected nil when upstream OverageStatus=DISABLED, got %q", acc.ID)
@@ -63,14 +59,13 @@ func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T)
 }
 
 func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
-	p := &AccountPool{}
 	account := config.Account{
 		ID:          "acct-1",
 		AccessToken: "access-token",
 		ExpiresAt:   time.Now().Unix() + 300,
+		Enabled:     true,
 	}
-
-	p.accounts = []config.Account{account}
+	p := newTestPool(account)
 
 	got := p.GetNext()
 	if got == nil {
@@ -168,11 +163,14 @@ func TestIsSuspensionErrorNilError(t *testing.T) {
 
 func newTestPool(accounts ...config.Account) *AccountPool {
 	p := &AccountPool{
-		cooldowns:   make(map[string]time.Time),
-		errorCounts: make(map[string]int),
-		modelLists:  make(map[string]map[string]bool),
+		modelLists: make(map[string]map[string]bool),
 	}
-	p.accounts = accounts
+	for i := range accounts {
+		p.states = append(p.states, &AccountState{
+			Account: accounts[i],
+			breaker: newBreaker(),
+		})
+	}
 	return p
 }
 
@@ -213,41 +211,44 @@ func TestGetNextForModelExcludingReturnsNilOnEmptyPool(t *testing.T) {
 // DisableAccount
 // ---------------------------------------------------------------------------
 
-func TestDisableAccountSetsCooldown(t *testing.T) {
-	// Initialize a temporary config so SetAccountBanStatus can persist safely.
+func TestDisableAccountDisablesBreaker(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	if err := config.AddAccount(config.Account{
+		ID:      "test-id",
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
 
-	p := newTestPool()
+	// Create pool manually and keep reference to the state
+	st := &AccountState{
+		Account: config.Account{ID: "test-id", Enabled: true},
+		breaker: newBreaker(),
+	}
+	p := &AccountPool{modelLists: make(map[string]map[string]bool)}
+	p.states = []*AccountState{st}
+
+	if st.breaker.StateString() != "CLOSED" {
+		t.Fatalf("expected CLOSED before disable, got %s", st.breaker.StateString())
+	}
+
 	p.DisableAccount("test-id", "test reason")
 
-	p.mu.RLock()
-	cooldown, ok := p.cooldowns["test-id"]
-	p.mu.RUnlock()
-
-	if !ok {
-		t.Fatal("expected cooldown to be set after DisableAccount")
-	}
-	// Safety-net cooldown must be at least 23 hours from now.
-	minExpected := time.Now().Add(23 * time.Hour)
-	if cooldown.Before(minExpected) {
-		t.Fatalf("expected cooldown >= 23h in future, got %v", cooldown)
+	// DisableAccount calls Reload which rebuilds states.
+	// The original AccountState should have its breaker set to DISABLED.
+	if st.breaker.StateString() != "DISABLED" {
+		t.Fatalf("expected DISABLED breaker after DisableAccount, got %s", st.breaker.StateString())
 	}
 }
 
 func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
-	p := &AccountPool{
-		accounts: []config.Account{
-			{ID: "a", Enabled: true},
-			{ID: "b", Enabled: true},
-		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
-	}
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
 
 	acc := p.GetNextExcluding(map[string]bool{"a": true})
 	if acc == nil || acc.ID != "b" {
@@ -256,16 +257,10 @@ func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
 }
 
 func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
-	p := &AccountPool{
-		accounts: []config.Account{
-			{ID: "a", Enabled: true},
-			{ID: "b", Enabled: true},
-		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
-	}
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
 	p.SetModelList("a", []string{"claude-sonnet-4.5"})
 	p.SetModelList("b", []string{"claude-sonnet-4.5"})
 

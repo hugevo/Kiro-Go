@@ -1,8 +1,10 @@
-// Package pool 账号池管理
-// 实现轮询负载均衡、错误冷却、Token 刷新
+// Package pool manages the account pool with circuit-breaking, EWMA latency
+// tracking, weighted selection, and concurrency control.
 package pool
 
 import (
+	"context"
+	"errors"
 	"kiro-go/config"
 	"strings"
 	"sync"
@@ -10,17 +12,60 @@ import (
 	"time"
 )
 
-const tokenRefreshSkewSeconds int64 = 120
+const (
+	tokenRefreshSkewSeconds int64   = 120
+	ewmaAlpha               float64 = 0.2
+)
 
-// AccountPool 账号池
+// AccountState wraps a config.Account with runtime state: circuit breaker,
+// EWMA latency, and usage counters.
+type AccountState struct {
+	Account      config.Account
+	breaker      CircuitBreaker
+	ewmaLatency  float64 // nanoseconds
+	successCount uint64
+	errorCount   uint64
+	lastUsed     time.Time
+}
+
+func (s *AccountState) recordLatency(latency time.Duration) {
+	if s.ewmaLatency == 0 {
+		s.ewmaLatency = float64(latency)
+	} else {
+		s.ewmaLatency = ewmaAlpha*float64(latency) + (1-ewmaAlpha)*s.ewmaLatency
+	}
+}
+
+func (s *AccountState) effectiveWeight(targetLatency float64) int {
+	base := effectiveWeight(s.Account.Weight)
+	if s.ewmaLatency == 0 || targetLatency == 0 {
+		return base
+	}
+	ratio := targetLatency / s.ewmaLatency
+	w := int(float64(base) * ratio)
+	if w < 1 {
+		w = 1
+	}
+	if maxW := base * 3; w > maxW {
+		w = maxW
+	}
+	return w
+}
+
+// newBreaker creates a circuit breaker with defaults suitable for the pool.
+func newBreaker() CircuitBreaker {
+	return *NewCircuitBreaker(3, 30*time.Second, 300*time.Second, 3600*time.Second)
+}
+
+// AccountPool manages a set of accounts with weighted round-robin dispatch.
 type AccountPool struct {
 	mu            sync.RWMutex
-	accounts      []config.Account
+	states        []*AccountState
 	totalAccounts int
 	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	modelLists    map[string]map[string]bool // accountID → set of modelIDs
+	sem           chan struct{}
+	queueTimeout  time.Duration
 }
 
 var (
@@ -28,120 +73,275 @@ var (
 	poolOnce sync.Once
 )
 
-// GetPool 获取全局账号池单例
+// GetPool returns the global account pool singleton.
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			modelLists:   make(map[string]map[string]bool),
+			queueTimeout: 30 * time.Second,
 		}
 		pool.Reload()
 	})
 	return pool
 }
 
-// Reload rebuilds the weighted account list from config.
-// Weight <= 1 → 1 entry; weight >= 2 → weight entries.
-// Over-quota accounts are dropped unless either the per-account upstream
-// Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
-// setting permits over-quota routing.
+// Reload rebuilds the state list from config, preserving existing AccountState
+// wrappers so circuit breaker and EWMA data survive across reloads.
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
-	var weighted []config.Account
+
+	existing := make(map[string]*AccountState)
+	for _, st := range p.states {
+		existing[st.Account.ID] = st
+	}
+
+	var newStates []*AccountState
 	for _, a := range enabled {
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
-		w := effectiveWeight(a.Weight)
-		for j := 0; j < w; j++ {
-			weighted = append(weighted, a)
+		if st, ok := existing[a.ID]; ok {
+			st.Account = a
+			newStates = append(newStates, st)
+		} else {
+			newStates = append(newStates, &AccountState{
+				Account: a,
+				breaker: newBreaker(),
+			})
 		}
 	}
-	p.accounts = weighted
+	p.states = newStates
 	p.totalAccounts = len(enabled)
+	p.SetMaxConcurrent(len(newStates) * 3)
 }
 
-// GetNext 获取下一个可用账号（加权轮询）
+// ---------------------------------------------------------------------------
+// Concurrency control (semaphore)
+// ---------------------------------------------------------------------------
+
+// SetMaxConcurrent configures the concurrency limit. n <= 0 auto-computes
+// len(states) × 3. The semaphore is re-created only when the capacity changes.
+func (p *AccountPool) SetMaxConcurrent(n int) {
+	if n <= 0 {
+		n = len(p.states) * 3
+	}
+	if n < 1 {
+		n = 1
+	}
+	if p.sem == nil || cap(p.sem) != n {
+		p.sem = make(chan struct{}, n)
+	}
+}
+
+// Acquire blocks until a concurrency slot is available or ctx expires.
+func (p *AccountPool) Acquire(ctx context.Context) error {
+	p.mu.RLock()
+	sem := p.sem
+	p.mu.RUnlock()
+	if sem == nil {
+		return nil
+	}
+	select {
+	case sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Release returns a concurrency slot to the pool.
+func (p *AccountPool) Release() {
+	p.mu.RLock()
+	sem := p.sem
+	p.mu.RUnlock()
+	if sem == nil {
+		return
+	}
+	select {
+	case <-sem:
+	default:
+	}
+}
+
+// QueueDepth returns the number of currently occupied concurrency slots.
+func (p *AccountPool) QueueDepth() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.sem == nil {
+		return 0
+	}
+	return len(p.sem)
+}
+
+// MaxConcurrent returns the total concurrency capacity.
+func (p *AccountPool) MaxConcurrent() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.sem == nil {
+		return 0
+	}
+	return cap(p.sem)
+}
+
+// ---------------------------------------------------------------------------
+// Account selection
+// ---------------------------------------------------------------------------
+
+// GetNext returns the next available account using weighted selection.
 func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
-// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// GetNextExcluding returns the next available account, skipping those in excluded.
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if len(p.accounts) == 0 {
+	if len(p.states) == 0 {
 		return nil
 	}
 
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
 
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
+	var candidates []*AccountState
+	targetLatency := p.ewmaTargetLatency()
 
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
+	for _, st := range p.states {
+		if excluded != nil && excluded[st.Account.ID] {
 			continue
 		}
-		if seen[acc.ID] {
+		if !st.breaker.CanRoute() {
 			continue
 		}
-
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
+		if st.Account.ExpiresAt > 0 && now.Unix() > st.Account.ExpiresAt-tokenRefreshSkewSeconds {
 			continue
 		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
+		if isQuotaBlocked(st.Account, allowOverUsage) {
 			continue
 		}
-
-		// Skip accounts whose quota is exhausted, unless overrides apply.
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		return acc
+		candidates = append(candidates, st)
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
+	if len(candidates) > 0 {
+		return p.selectWeighted(candidates, targetLatency)
+	}
+
+	// Fallback: pick any HALF_OPEN account
+	for _, st := range p.states {
+		if excluded != nil && excluded[st.Account.ID] {
 			continue
 		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
+		if st.breaker.StateString() == "HALF_OPEN" {
+			return &st.Account
 		}
 	}
-	return best
+	return nil
 }
 
-// SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
+// selectWeighted picks one account from candidates using their effective weights.
+func (p *AccountPool) selectWeighted(candidates []*AccountState, targetLatency float64) *config.Account {
+	if len(candidates) == 1 {
+		return &candidates[0].Account
+	}
+
+	totalWeight := 0
+	weights := make([]int, len(candidates))
+	for i, st := range candidates {
+		w := st.effectiveWeight(targetLatency)
+		totalWeight += w
+		weights[i] = w
+	}
+
+	if totalWeight == 0 {
+		return &candidates[0].Account
+	}
+
+	idx := int(atomic.AddUint64(&p.currentIndex, 1) % uint64(totalWeight))
+	cumulative := 0
+	for i, w := range weights {
+		cumulative += w
+		if idx < cumulative {
+			return &candidates[i].Account
+		}
+	}
+	return &candidates[len(candidates)-1].Account
+}
+
+// ewmaTargetLatency computes the average EWMA latency across all accounts.
+func (p *AccountPool) ewmaTargetLatency() float64 {
+	var sum float64
+	count := 0
+	for _, st := range p.states {
+		if st.ewmaLatency > 0 {
+			sum += st.ewmaLatency
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+// ---------------------------------------------------------------------------
+// Model-aware selection
+// ---------------------------------------------------------------------------
+
+// GetNextForModel returns the next available account supporting the given model.
+func (p *AccountPool) GetNextForModel(model string) *config.Account {
+	return p.GetNextForModelExcluding(model, nil)
+}
+
+// GetNextForModelExcluding returns the next available account supporting the
+// given model, skipping those in excluded.
+func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if len(p.states) == 0 {
+		return nil
+	}
+
+	allowOverUsage := config.GetAllowOverUsage()
+	now := time.Now()
+	targetLatency := p.ewmaTargetLatency()
+
+	var candidates []*AccountState
+	for _, st := range p.states {
+		if excluded != nil && excluded[st.Account.ID] {
+			continue
+		}
+		if !st.breaker.CanRoute() {
+			continue
+		}
+		if !p.accountHasModel(st.Account.ID, model) {
+			continue
+		}
+		if st.Account.ExpiresAt > 0 && now.Unix() > st.Account.ExpiresAt-tokenRefreshSkewSeconds {
+			continue
+		}
+		if isQuotaBlocked(st.Account, allowOverUsage) {
+			continue
+		}
+		candidates = append(candidates, st)
+	}
+
+	if len(candidates) > 0 {
+		return p.selectWeighted(candidates, targetLatency)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Model list cache
+// ---------------------------------------------------------------------------
+
+// SetModelList caches the set of model IDs supported by an account.
 func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 	set := make(map[string]bool, len(modelIDs))
 	for _, id := range modelIDs {
@@ -152,8 +352,7 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 	p.mu.Unlock()
 }
 
-// GetModelList 返回该账号缓存的模型 ID 列表（供 admin API 使用）。
-// 若尚无缓存则返回空切片。
+// GetModelList returns the cached model IDs for an account.
 func (p *AccountPool) GetModelList(accountID string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -168,141 +367,216 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 	return ids
 }
 
-// accountHasModel 检查账号是否支持指定模型。
-// 若该账号尚无模型列表（冷启动），视为支持所有模型。
+// accountHasModel checks whether an account supports a given model.
+// Returns true if the model list is not yet loaded (cold start).
 func (p *AccountPool) accountHasModel(accountID, model string) bool {
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
-		return true // 冷启动：列表未就绪，乐观放行
+		return true
 	}
 	return list[strings.ToLower(strings.TrimSpace(model))]
 }
 
-// GetNextForModel 获取下一个支持指定模型的可用账号。
-// model 应为去掉 thinking 后缀的实际模型名。
-// 若无账号有该模型列表数据，行为与 GetNext 相同（乐观路由）。
-func (p *AccountPool) GetNextForModel(model string) *config.Account {
-	return p.GetNextForModelExcluding(model, nil)
-}
+// ---------------------------------------------------------------------------
+// Lookup + lifecycle
+// ---------------------------------------------------------------------------
 
-// GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
-func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
-	}
-
-	allowOverUsage := config.GetAllowOverUsage()
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-		return acc
-	}
-
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
-		}
-	}
-	return best
-}
-
-// GetByID 根据 ID 获取账号
+// GetByID finds an account by ID in the pool.
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	for i := range p.accounts {
-		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			return &st.Account
 		}
 	}
 	return nil
 }
 
-// RecordSuccess 记录请求成功，清除冷却
-func (p *AccountPool) RecordSuccess(id string) {
+// RecordSuccess clears the breaker for a successful request and updates EWMA.
+func (p *AccountPool) RecordSuccess(id string, latency time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.cooldowns, id)
-	p.errorCounts[id] = 0
-}
-
-// RecordError 记录请求错误，设置冷却
-func (p *AccountPool) RecordError(id string, isQuotaError bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.errorCounts[id]++
-
-	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
-	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = time.Now().Add(time.Minute)
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			st.breaker.Transition(nil, "")
+			st.recordLatency(latency)
+			atomic.AddUint64(&st.successCount, 1)
+			st.lastUsed = time.Now()
+			return
+		}
 	}
 }
 
-// IsAuthFailure reports whether an error indicates the refresh token / credentials
-// have been revoked or invalidated upstream (401, 403 with auth markers, etc.).
-// These accounts cannot be recovered automatically and must be re-authenticated.
+// RecordError records a failed request and may open the circuit breaker.
+func (p *AccountPool) RecordError(id string, err error, isQuotaError bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			errorType := "transient"
+			if IsAuthFailure(err) {
+				errorType = "auth"
+			} else if isQuotaError {
+				errorType = "quota"
+			}
+			st.breaker.Transition(err, errorType)
+			atomic.AddUint64(&st.errorCount, 1)
+			return
+		}
+	}
+}
+
+// MarkOverLimit puts an account into quota cooldown and reloads.
+func (p *AccountPool) MarkOverLimit(id string) {
+	p.mu.Lock()
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			st.breaker.Transition(errors.New("over limit"), "quota")
+		}
+	}
+	p.mu.Unlock()
+	p.Reload()
+}
+
+// DisableAccount marks an account as disabled and reloads the pool.
+func (p *AccountPool) DisableAccount(id, reason string) {
+	if err := config.SetAccountBanStatus(id, "DISABLED", reason); err != nil {
+		_ = err
+	}
+	p.mu.Lock()
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			st.breaker.Transition(errors.New("account disabled"), "auth")
+		}
+	}
+	p.mu.Unlock()
+	p.Reload()
+}
+
+// UpdateToken refreshes the access/refresh token for an account in-memory.
+func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			st.Account.AccessToken = accessToken
+			if refreshToken != "" {
+				st.Account.RefreshToken = refreshToken
+			}
+			st.Account.ExpiresAt = expiresAt
+		}
+	}
+}
+
+// Count returns total number of unique accounts (including disabled).
+func (p *AccountPool) Count() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.totalAccounts > 0 {
+		return p.totalAccounts
+	}
+	seen := make(map[string]bool)
+	for _, st := range p.states {
+		seen[st.Account.ID] = true
+	}
+	return len(seen)
+}
+
+// AvailableCount returns the number of accounts currently routable.
+func (p *AccountPool) AvailableCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	count := 0
+	seen := make(map[string]bool)
+	for _, st := range p.states {
+		if seen[st.Account.ID] {
+			continue
+		}
+		seen[st.Account.ID] = true
+		if st.breaker.CanRoute() {
+			count++
+		}
+	}
+	return count
+}
+
+// UpdateStats increments per-account request and token counters.
+func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
+	p.mu.Lock()
+	var requestCount, errorCount, totalTokens int
+	var totalCredits float64
+	var lastUsed int64
+	var updated bool
+	for _, st := range p.states {
+		if st.Account.ID == id {
+			if !updated {
+				st.Account.RequestCount++
+				st.Account.TotalTokens += tokens
+				st.Account.TotalCredits += credits
+				st.Account.LastUsed = time.Now().Unix()
+				requestCount = st.Account.RequestCount
+				errorCount = int(atomic.LoadUint64(&st.errorCount))
+				totalTokens = st.Account.TotalTokens
+				totalCredits = st.Account.TotalCredits
+				lastUsed = st.Account.LastUsed
+				updated = true
+				continue
+			}
+			st.Account.RequestCount = requestCount
+			st.Account.ErrorCount = errorCount
+			st.Account.TotalTokens = totalTokens
+			st.Account.TotalCredits = totalCredits
+			st.Account.LastUsed = lastUsed
+		}
+	}
+	p.mu.Unlock()
+	if updated {
+		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+	}
+}
+
+// GetAllAccounts returns a snapshot of all account configs in the pool.
+func (p *AccountPool) GetAllAccounts() []config.Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]config.Account, len(p.states))
+	for i, st := range p.states {
+		result[i] = st.Account
+	}
+	return result
+}
+
+// GetStatus returns runtime status for all accounts (admin API).
+func (p *AccountPool) GetStatus() []map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	target := p.ewmaTargetLatency()
+	result := make([]map[string]interface{}, len(p.states))
+	for i, st := range p.states {
+		result[i] = map[string]interface{}{
+			"id":              st.Account.ID,
+			"state":           st.breaker.StateString(),
+			"ewmaLatency":     time.Duration(st.ewmaLatency).String(),
+			"effectiveWeight": st.effectiveWeight(target),
+			"successes":       atomic.LoadUint64(&st.successCount),
+			"errors":          atomic.LoadUint64(&st.errorCount),
+		}
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Error classification (unchanged)
+// ---------------------------------------------------------------------------
+
+// IsAuthFailure reports whether an error indicates revoked credentials.
 func IsAuthFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
 	lower := strings.ToLower(msg)
-
-	// Match HTTP status codes only when they appear as standalone tokens to avoid
-	// false positives from arbitrary digits in the error body (e.g. request IDs).
 	if hasStatusToken(msg, "401") || hasStatusToken(msg, "403") {
 		return true
 	}
@@ -319,8 +593,6 @@ func IsAuthFailure(err error) bool {
 	return false
 }
 
-// hasStatusToken returns true when status appears in s with non-digit boundaries
-// on both sides, so "401" matches "HTTP 401 from ..." but not "request_401abc".
 func hasStatusToken(s, status string) bool {
 	for {
 		idx := strings.Index(s, status)
@@ -337,14 +609,9 @@ func hasStatusToken(s, status string) bool {
 	}
 }
 
-func isDigit(b byte) bool {
-	return b >= '0' && b <= '9'
-}
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
-// IsSuspensionError reports whether the error indicates the account has been
-// temporarily suspended by upstream or has no available Kiro profile.
-// Unlike auth failures (revoked credentials), these may be transient, but
-// the account should be disabled until an operator re-enables it.
+// IsSuspensionError reports whether the error indicates the account is suspended.
 func IsSuspensionError(err error) bool {
 	if err == nil {
 		return false
@@ -355,140 +622,18 @@ func IsSuspensionError(err error) bool {
 		strings.Contains(lower, "no available kiro profile")
 }
 
-// DisableAccount marks an account as disabled (auth revoked / unrecoverable),
-// removes it from the in-memory pool so subsequent requests skip it, and
-// persists the change via config.SetAccountBanStatus.
-func (p *AccountPool) DisableAccount(id, reason string) {
-	if err := config.SetAccountBanStatus(id, "DISABLED", reason); err != nil {
-		// best effort — even if persistence fails, drop it from memory
-		_ = err
-	}
-	p.mu.Lock()
-	// Long cooldown as a safety net in case Reload races
-	p.cooldowns[id] = time.Now().Add(24 * time.Hour)
-	p.mu.Unlock()
-	p.Reload()
-}
-
-// MarkOverLimit marks an account as over usage limit (after a 402 / OVERAGE response).
-// With the upstream OverageStatus model, the live status is refreshed via
-// FetchOverageStatus from the request handler; here we just cooldown briefly so
-// the next attempt picks a different account, then reload.
-func (p *AccountPool) MarkOverLimit(id string) {
-	p.mu.Lock()
-	p.cooldowns[id] = time.Now().Add(time.Hour)
-	p.mu.Unlock()
-	p.Reload()
-}
-
-// UpdateToken 更新账号 Token
-func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i := range p.accounts {
-		if p.accounts[i].ID == id {
-			p.accounts[i].AccessToken = accessToken
-			if refreshToken != "" {
-				p.accounts[i].RefreshToken = refreshToken
-			}
-			p.accounts[i].ExpiresAt = expiresAt
-		}
-	}
-}
-
-// Count 返回账号总数
-func (p *AccountPool) Count() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.totalAccounts > 0 {
-		return p.totalAccounts
-	}
-
-	seen := make(map[string]bool)
-	for _, acc := range p.accounts {
-		seen[acc.ID] = true
-	}
-	return len(seen)
-}
-
-// AvailableCount 返回可用账号数
-func (p *AccountPool) AvailableCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	count := 0
-	seen := make(map[string]bool)
-	for _, acc := range p.accounts {
-		if seen[acc.ID] {
-			continue
-		}
-		seen[acc.ID] = true
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			continue
-		}
-		count++
-	}
-	return count
-}
-
-// UpdateStats 更新账号统计
-func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	var updated bool
-	var requestCount, errorCount, totalTokens int
-	var totalCredits float64
-	var lastUsed int64
-	for i := range p.accounts {
-		if p.accounts[i].ID == id {
-			if !updated {
-				p.accounts[i].RequestCount++
-				p.accounts[i].TotalTokens += tokens
-				p.accounts[i].TotalCredits += credits
-				p.accounts[i].LastUsed = time.Now().Unix()
-
-				requestCount = p.accounts[i].RequestCount
-				errorCount = p.accounts[i].ErrorCount
-				totalTokens = p.accounts[i].TotalTokens
-				totalCredits = p.accounts[i].TotalCredits
-				lastUsed = p.accounts[i].LastUsed
-				updated = true
-				continue
-			}
-			p.accounts[i].RequestCount = requestCount
-			p.accounts[i].ErrorCount = errorCount
-			p.accounts[i].TotalTokens = totalTokens
-			p.accounts[i].TotalCredits = totalCredits
-			p.accounts[i].LastUsed = lastUsed
-		}
-	}
-	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
-	}
-}
-
-// GetAllAccounts 获取所有账号副本
-func (p *AccountPool) GetAllAccounts() []config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	result := make([]config.Account, len(p.accounts))
-	copy(result, p.accounts)
-	return result
-}
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 func isOverUsageLimit(acc config.Account) bool {
 	return acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit
 }
 
-// isQuotaBlocked reports whether an over-quota account should be skipped:
-// the per-account upstream Overages switch (OverageStatus=ENABLED) and the
-// global allowOverUsage setting are the two ways to keep it routable.
 func isQuotaBlocked(acc config.Account, allowOverUsage bool) bool {
 	return isOverUsageLimit(acc) && !isUpstreamOverageEnabled(acc) && !allowOverUsage
 }
 
-// isUpstreamOverageEnabled reports whether the upstream Overages switch is ON for this account.
-// "ENABLED" → true; anything else (DISABLED, UNKNOWN, empty) → false.
 func isUpstreamOverageEnabled(acc config.Account) bool {
 	return strings.EqualFold(acc.OverageStatus, "ENABLED")
 }

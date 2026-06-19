@@ -1253,7 +1253,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordSuccess(account.ID, time.Since(reqStart))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1515,7 +1515,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordSuccess(account.ID, time.Since(reqStart))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1963,7 +1963,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordSuccess(account.ID, time.Since(reqStart))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -2068,7 +2068,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordSuccess(account.ID, time.Since(reqStart))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -2833,6 +2833,7 @@ func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
 		"sessionId": session.ID,
 		"signInUrl": signInURL,
 		"interval":  2,
