@@ -2451,7 +2451,6 @@
       '<p class="help-block">' + escapeHtml(t('modal.enterpriseSsoDesc')) + '</p>' +
       '<div id="kiroSsoStep1">' +
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
-      '<div class="form-group mt-3"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="kiroSsoRegion" value="us-east-1" /></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startKiroSsoBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
@@ -2472,8 +2471,10 @@
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
   }
   async function startKiroSsoLogin() {
-    const region = $('kiroSsoRegion').value || 'us-east-1';
-    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({ region }) });
+    // No region prompt: the data-plane region is derived from the profile ARN
+    // returned by SSO (social) or discovered via the cross-region profile probe
+    // (external_idp / Azure), so the operator never has to know it up front.
+    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
     const d = await res.json();
     if (d.sessionId && d.signInUrl) {
       kiroSsoSession = d.sessionId;
