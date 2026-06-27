@@ -182,6 +182,11 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// AutoRecoverEnabled controls whether disabled accounts (auth failure) are
+	// periodically re-probed with a token refresh. Default true. Set false to
+	// require manual re-enable.
+	AutoRecoverEnabled *bool `json:"autoRecoverEnabled,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -857,6 +862,17 @@ func GetAllowOverUsage() bool {
 		return false
 	}
 	return cfg.AllowOverUsage
+}
+
+// GetAutoRecoverEnabled returns whether auto-recovery of disabled accounts is
+// enabled. Defaults to true.
+func GetAutoRecoverEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AutoRecoverEnabled == nil {
+		return true
+	}
+	return *cfg.AutoRecoverEnabled
 }
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.

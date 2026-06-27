@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"kiro-go/auth"
 	"kiro-go/config"
 	"strings"
 	"sync"
@@ -14,13 +15,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	mu             sync.RWMutex
+	accounts       []config.Account
+	totalAccounts  int
+	currentIndex   uint64
+	cooldowns      map[string]time.Time       // 账号冷却时间
+	errorCounts    map[string]int             // 连续错误计数
+	modelLists     map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	reprobeBackoff map[string]time.Duration   // accountID → next backoff interval
+	reprobeNext    map[string]time.Time       // accountID → when to next probe
+	stopRecover    chan struct{}
 }
 
 var (
@@ -32,11 +36,16 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:      make(map[string]time.Time),
+			errorCounts:    make(map[string]int),
+			modelLists:     make(map[string]map[string]bool),
+			reprobeBackoff: make(map[string]time.Duration),
+			reprobeNext:    make(map[string]time.Time),
 		}
 		pool.Reload()
+		if config.GetAutoRecoverEnabled() {
+			pool.startAutoRecover()
+		}
 	})
 	return pool
 }
@@ -498,4 +507,71 @@ func effectiveWeight(weight int) int {
 		return 1
 	}
 	return weight
+}
+
+// startAutoRecover launches a background goroutine that periodically refreshes
+// disabled accounts' tokens. If a refresh succeeds, the account is re-enabled.
+// Exponential backoff per account: 1m → 5m → 30m → max 2h.
+func (p *AccountPool) startAutoRecover() {
+	p.stopRecover = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				p.reprobeDisabled()
+			case <-p.stopRecover:
+				return
+			}
+		}
+	}()
+}
+
+// reprobeDisabled iterates disabled accounts whose reprobe time has arrived,
+// attempts a token refresh, and re-enables on success.
+func (p *AccountPool) reprobeDisabled() {
+	if !config.GetAutoRecoverEnabled() {
+		return
+	}
+	now := time.Now()
+	all := config.GetAccounts()
+	for _, acc := range all {
+		if acc.Enabled || acc.BanStatus != "DISABLED" {
+			continue
+		}
+		// Check backoff schedule.
+		p.mu.Lock()
+		next, ok := p.reprobeNext[acc.ID]
+		backoff := p.reprobeBackoff[acc.ID]
+		p.mu.Unlock()
+		if ok && now.Before(next) {
+			continue // not time yet
+		}
+		// Attempt refresh.
+		_, _, _, _, err := auth.RefreshToken(&acc)
+		if err == nil {
+			// Success! Re-enable.
+			config.SetAccountEnabled(acc.ID, true)
+			p.Reload()
+			p.mu.Lock()
+			delete(p.reprobeBackoff, acc.ID)
+			delete(p.reprobeNext, acc.ID)
+			p.mu.Unlock()
+			continue
+		}
+		// Failure → increase backoff: 1m → 5m → 30m → 2h max.
+		if backoff == 0 {
+			backoff = time.Minute
+		} else {
+			backoff *= 5
+			if backoff > 2*time.Hour {
+				backoff = 2 * time.Hour
+			}
+		}
+		p.mu.Lock()
+		p.reprobeBackoff[acc.ID] = backoff
+		p.reprobeNext[acc.ID] = now.Add(backoff)
+		p.mu.Unlock()
+	}
 }
