@@ -187,6 +187,10 @@ type Config struct {
 	// require manual re-enable.
 	AutoRecoverEnabled *bool `json:"autoRecoverEnabled,omitempty"`
 
+	// SessionAffinityEnabled binds consecutive requests from the same API key to
+	// the same account (sticky routing) for a TTL window. Default false.
+	SessionAffinityEnabled bool `json:"sessionAffinityEnabled,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -873,6 +877,25 @@ func GetAutoRecoverEnabled() bool {
 		return true
 	}
 	return *cfg.AutoRecoverEnabled
+}
+
+// GetSessionAffinityEnabled returns whether session affinity (sticky routing per
+// API key) is enabled. Defaults to false.
+func GetSessionAffinityEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.SessionAffinityEnabled
+}
+
+// SetSessionAffinityEnabled sets the session-affinity flag and persists it.
+func SetSessionAffinityEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.SessionAffinityEnabled = enabled
+	return Save()
 }
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.

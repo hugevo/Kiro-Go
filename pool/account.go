@@ -19,6 +19,7 @@ const (
 	circuitHalfOpen        = 2
 	circuitErrorThreshold  = 5
 	circuitOpenDuration    = 30 * time.Second
+	sessionAffinityTTL     = 10 * time.Minute
 )
 
 type circuitBreaker struct {
@@ -33,6 +34,12 @@ type accountHealth struct {
 	ewmaLatencyMs float64 // EWMA latency (α=0.3)
 	successCount  int
 	errorCount    int
+}
+
+// apiKeyBinding binds an API key to a preferred account for session affinity.
+type apiKeyBinding struct {
+	accountID string
+	lastUsed  time.Time
 }
 
 // isCircuitOpen reports whether an account's circuit breaker is currently open
@@ -95,6 +102,7 @@ type AccountPool struct {
 	stopRecover    chan struct{}
 	circuitState   map[string]*circuitBreaker // accountID → circuit breaker state
 	healthStats    map[string]*accountHealth  // accountID → EWMA latency + error/success counts
+	apiKeyAffinity map[string]apiKeyBinding   // apiKeyID → preferred account (sticky routing)
 }
 
 var (
@@ -113,6 +121,7 @@ func GetPool() *AccountPool {
 			reprobeNext:    make(map[string]time.Time),
 			circuitState:   make(map[string]*circuitBreaker),
 			healthStats:    make(map[string]*accountHealth),
+			apiKeyAffinity: make(map[string]apiKeyBinding),
 		}
 		pool.Reload()
 		if config.GetAutoRecoverEnabled() {
@@ -275,6 +284,45 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 		}
 	}
 	return nil
+}
+
+// GetNextForModelWithApiKey selects an account for a request, preferring the one
+// already bound to the API key (session affinity). Falls back to health-aware
+// scoring if the bound account is unavailable or affinity is disabled.
+func (p *AccountPool) GetNextForModelWithApiKey(model string, excluded map[string]bool, apiKey string) *config.Account {
+	// Session affinity: try the bound account first.
+	if apiKey != "" && config.GetSessionAffinityEnabled() {
+		p.mu.RLock()
+		binding, ok := p.apiKeyAffinity[apiKey]
+		p.mu.RUnlock()
+		if ok && time.Since(binding.lastUsed) < sessionAffinityTTL {
+			// Check if the bound account is available.
+			acc := p.GetByID(binding.accountID)
+			if acc != nil && acc.Enabled {
+				isExcluded := excluded != nil && excluded[acc.ID]
+				p.mu.RLock()
+				cooldown, hasCooldown := p.cooldowns[acc.ID]
+				p.mu.RUnlock()
+				cooldownActive := hasCooldown && time.Now().Before(cooldown)
+				if !isExcluded && !cooldownActive && !p.isCircuitOpen(acc.ID, time.Now()) {
+					p.mu.Lock()
+					binding.lastUsed = time.Now()
+					p.apiKeyAffinity[apiKey] = binding
+					p.mu.Unlock()
+					return acc
+				}
+			}
+		}
+	}
+
+	// Fall back to normal selection.
+	acc := p.GetNextForModelExcluding(model, excluded)
+	if acc != nil && apiKey != "" && config.GetSessionAffinityEnabled() {
+		p.mu.Lock()
+		p.apiKeyAffinity[apiKey] = apiKeyBinding{accountID: acc.ID, lastUsed: time.Now()}
+		p.mu.Unlock()
+	}
+	return acc
 }
 
 // RecordSuccess 记录请求成功，清除冷却

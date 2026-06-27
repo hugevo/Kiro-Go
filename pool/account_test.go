@@ -418,6 +418,46 @@ func TestHealthAwareScoringPrefersHealthyAccount(t *testing.T) {
 	}
 }
 
+// TestSessionAffinityBindsApiKeyToAccount verifies that 2 consecutive requests
+// from the same API key route to the same account.
+func TestSessionAffinityBindsApiKeyToAccount(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// Enable session affinity (opt-in, default false).
+	if err := config.SetSessionAffinityEnabled(true); err != nil {
+		t.Fatalf("SetSessionAffinityEnabled: %v", err)
+	}
+	config.AddAccount(config.Account{ID: "a", Enabled: true, AuthMethod: "social", Region: "us-east-1"})
+	config.AddAccount(config.Account{ID: "b", Enabled: true, AuthMethod: "social", Region: "us-east-1"})
+
+	p := &AccountPool{
+		cooldowns:      make(map[string]time.Time),
+		errorCounts:    make(map[string]int),
+		modelLists:     make(map[string]map[string]bool),
+		circuitState:   make(map[string]*circuitBreaker),
+		healthStats:    make(map[string]*accountHealth),
+		apiKeyAffinity: make(map[string]apiKeyBinding),
+	}
+	p.Reload()
+
+	// First request from "key-1" → binds to whichever account.
+	acc1 := p.GetNextForModelWithApiKey("model", nil, "key-1")
+	if acc1 == nil {
+		t.Fatalf("expected an account, got nil")
+	}
+
+	// Second request from "key-1" → should return the SAME account.
+	acc2 := p.GetNextForModelWithApiKey("model", nil, "key-1")
+	if acc2 == nil {
+		t.Fatalf("expected an account, got nil")
+	}
+	if acc1.ID != acc2.ID {
+		t.Fatalf("session affinity broken: first=%q second=%q", acc1.ID, acc2.ID)
+	}
+}
+
 func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
