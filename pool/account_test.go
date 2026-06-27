@@ -379,6 +379,45 @@ func TestCircuitBreakerOpensAfterConsecutiveErrors(t *testing.T) {
 	}
 }
 
+// TestHealthAwareScoringPrefersHealthyAccount verifies that a healthy account
+// (0 errors, low latency) is selected more often than a failing one.
+func TestHealthAwareScoringPrefersHealthyAccount(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	config.AddAccount(config.Account{ID: "healthy", Enabled: true, AuthMethod: "social", Region: "us-east-1"})
+	config.AddAccount(config.Account{ID: "failing", Enabled: true, AuthMethod: "social", Region: "us-east-1"})
+
+	p := &AccountPool{
+		cooldowns:    make(map[string]time.Time),
+		errorCounts:  make(map[string]int),
+		modelLists:   make(map[string]map[string]bool),
+		circuitState: make(map[string]*circuitBreaker),
+		healthStats:  make(map[string]*accountHealth),
+	}
+	p.Reload()
+
+	// Make "failing" look unhealthy: record errors + high latency.
+	for i := 0; i < 4; i++ {
+		p.RecordError("failing", false)
+	}
+	p.recordLatency("failing", 5000) // 5s latency
+	p.recordLatency("healthy", 100)  // 100ms latency
+
+	// Sample 100 selections — healthy should win the majority.
+	healthyCount := 0
+	for i := 0; i < 100; i++ {
+		acc := p.GetNextForModelExcluding("model", nil)
+		if acc != nil && acc.ID == "healthy" {
+			healthyCount++
+		}
+	}
+	if healthyCount < 60 {
+		t.Fatalf("expected healthy account selected >60%% of the time, got %d%%", healthyCount)
+	}
+}
+
 func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {

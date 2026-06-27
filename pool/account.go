@@ -5,9 +5,9 @@ package pool
 import (
 	"kiro-go/auth"
 	"kiro-go/config"
+	"math/rand"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +25,14 @@ type circuitBreaker struct {
 	state          int
 	consecutiveErr int
 	openedAt       time.Time
+}
+
+// accountHealth tracks per-account health signals used by score-weighted
+// selection: EWMA latency plus success/error counts.
+type accountHealth struct {
+	ewmaLatencyMs float64 // EWMA latency (α=0.3)
+	successCount  int
+	errorCount    int
 }
 
 // isCircuitOpen reports whether an account's circuit breaker is currently open
@@ -86,6 +94,7 @@ type AccountPool struct {
 	reprobeNext    map[string]time.Time       // accountID → when to next probe
 	stopRecover    chan struct{}
 	circuitState   map[string]*circuitBreaker // accountID → circuit breaker state
+	healthStats    map[string]*accountHealth  // accountID → EWMA latency + error/success counts
 }
 
 var (
@@ -103,6 +112,7 @@ func GetPool() *AccountPool {
 			reprobeBackoff: make(map[string]time.Duration),
 			reprobeNext:    make(map[string]time.Time),
 			circuitState:   make(map[string]*circuitBreaker),
+			healthStats:    make(map[string]*accountHealth),
 		}
 		pool.Reload()
 		if config.GetAutoRecoverEnabled() {
@@ -112,8 +122,8 @@ func GetPool() *AccountPool {
 	return pool
 }
 
-// Reload rebuilds the weighted account list from config.
-// Weight <= 1 → 1 entry; weight >= 2 → weight entries.
+// Reload rebuilds the account list from config (one entry per account; weight is
+// handled as selection probability by healthScore, not as duplicated slots).
 // Over-quota accounts are dropped unless either the per-account upstream
 // Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
 // setting permits over-quota routing.
@@ -122,17 +132,14 @@ func (p *AccountPool) Reload() {
 	defer p.mu.Unlock()
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
-	var weighted []config.Account
+	var accounts []config.Account
 	for _, a := range enabled {
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
-		w := effectiveWeight(a.Weight)
-		for j := 0; j < w; j++ {
-			weighted = append(weighted, a)
-		}
+		accounts = append(accounts, a) // one entry per account (weight handled by score)
 	}
-	p.accounts = weighted
+	p.accounts = accounts
 	p.totalAccounts = len(enabled)
 }
 
@@ -141,81 +148,10 @@ func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
-// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// GetNextExcluding 获取下一个可用账号（健康加权随机），并跳过指定账号。
+// Delegates to GetNextForModelExcluding with model="" (any model).
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
-	}
-
-	allowOverUsage := config.GetAllowOverUsage()
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// Skip accounts with an open circuit breaker.
-		if p.isCircuitOpenLocked(acc.ID, now) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// Skip accounts whose quota is exhausted, unless overrides apply.
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		return acc
-	}
-
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
-		}
-	}
-	return best
+	return p.GetNextForModelExcluding("", excluded)
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -262,7 +198,10 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
-// GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
+// GetNextForModelExcluding selects an account supporting the model using
+// health-aware, score-weighted random selection (weight = probability, not
+// slot count). Skips excluded, cooled-down, circuit-open, token-expiring, and
+// quota-blocked accounts. model="" means "any model".
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -273,69 +212,57 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
 
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// Skip accounts with an open circuit breaker.
-		if p.isCircuitOpenLocked(acc.ID, now) {
-			seen[acc.ID] = true
-			continue
-		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-		return acc
+	// Build candidate list with health scores.
+	type candidate struct {
+		acc   *config.Account
+		score float64
 	}
-
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
+	var candidates []candidate
+	totalScore := 0.0
 	for i := range p.accounts {
 		acc := &p.accounts[i]
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
-		if !p.accountHasModel(acc.ID, model) {
+		if model != "" && !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			continue
+		}
+		if p.isCircuitOpenLocked(acc.ID, now) {
+			continue
+		}
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
+		score := p.healthScore(acc.ID, effectiveWeight(acc.Weight))
+		if score <= 0 {
+			score = 0.01 // tiny non-zero so a degraded account is still selectable as fallback
+		}
+		candidates = append(candidates, candidate{acc, score})
+		totalScore += score
+	}
+
+	if len(candidates) == 0 {
+		// Fallback: return the account with the earliest cooldown.
+		return p.fallbackEarliestCooldown(model, excluded, allowOverUsage)
+	}
+
+	// Score-weighted random selection.
+	r := rand.Float64() * totalScore
+	cumulative := 0.0
+	for _, c := range candidates {
+		cumulative += c.score
+		if r <= cumulative {
+			return c.acc
 		}
 	}
-	return best
+	return candidates[len(candidates)-1].acc
 }
 
 // GetByID 根据 ID 获取账号
@@ -360,6 +287,11 @@ func (p *AccountPool) RecordSuccess(id string) {
 	if cb, ok := p.circuitState[id]; ok && cb != nil {
 		cb.state = circuitClosed
 		cb.consecutiveErr = 0
+	}
+	// Health stats: record success.
+	if h, ok := p.healthStats[id]; ok && h != nil {
+		h.successCount++
+		h.errorCount = 0
 	}
 }
 
@@ -392,6 +324,16 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	} else if cb.consecutiveErr >= circuitErrorThreshold && cb.state == circuitClosed {
 		cb.state = circuitOpen
 		cb.openedAt = time.Now()
+	}
+	// Health stats: record error (create entry so errorRate is accurate).
+	// Guard against nil healthStats (test pools may leave it uninitialized).
+	if p.healthStats != nil {
+		h := p.healthStats[id]
+		if h == nil {
+			h = &accountHealth{}
+			p.healthStats[id] = h
+		}
+		h.errorCount++
 	}
 }
 
@@ -602,6 +544,73 @@ func effectiveWeight(weight int) int {
 		return 1
 	}
 	return weight
+}
+
+// recordLatency records an observed request latency into the account's EWMA
+// (α=0.3). Called from request handlers after a response completes.
+func (p *AccountPool) recordLatency(id string, latencyMs float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	h := p.healthStats[id]
+	if h == nil {
+		h = &accountHealth{}
+		p.healthStats[id] = h
+	}
+	if h.ewmaLatencyMs == 0 {
+		h.ewmaLatencyMs = latencyMs
+	} else {
+		h.ewmaLatencyMs = 0.3*latencyMs + 0.7*h.ewmaLatencyMs
+	}
+}
+
+// healthScore returns a selection weight for the account: higher = preferred.
+// score = effectiveWeight × (1 - errorRate) × (1 / (1 + latency/1000))
+// Lock-free: the caller (GetNextForModelExcluding) already holds p.mu RLock.
+func (p *AccountPool) healthScore(id string, weight int) float64 {
+	w := float64(weight)
+	if w < 1 {
+		w = 1
+	}
+	h := p.healthStats[id]
+	if h == nil {
+		return w // no data → default weight
+	}
+	total := h.successCount + h.errorCount
+	if total == 0 {
+		return w
+	}
+	errorRate := float64(h.errorCount) / float64(total)
+	latencyFactor := 1.0 / (1.0 + h.ewmaLatencyMs/1000.0)
+	return w * (1.0 - errorRate) * latencyFactor
+}
+
+// fallbackEarliestCooldown returns the account with the earliest cooldown
+// (or one with no cooldown at all) when no fully-healthy candidate exists.
+// model="" means "any model". Caller must hold p.mu (at least RLock).
+func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string]bool, allowOverUsage bool) *config.Account {
+	var best *config.Account
+	var earliest time.Time
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		if model != "" && !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if isQuotaBlocked(*acc, allowOverUsage) {
+			continue
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok {
+			if best == nil || cooldown.Before(earliest) {
+				best = acc
+				earliest = cooldown
+			}
+		} else {
+			return acc
+		}
+	}
+	return best
 }
 
 // startAutoRecover launches a background goroutine that periodically refreshes
