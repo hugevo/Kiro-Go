@@ -251,24 +251,40 @@ func TestSetExternalIdpValidatorForTestSwapsAndRestores(t *testing.T) {
 }
 
 // TestDeriveExternalIdpEndpoints verifies the endpoints+scopes are reconstructed
-// from a Kiro userId (which embeds the Azure tenant) + the Kiro client ID. This is
-// what lets the import path accept Kiro Account Manager exports, whose credentials
-// block omits tokenEndpoint/issuerUrl/scopes.
+// from userId (Kiro export) OR the accessToken JWT issuer (bare blobs), plus the
+// Kiro client ID. This is what lets the import path accept shapes that omit
+// tokenEndpoint/issuerUrl/scopes.
 func TestDeriveExternalIdpEndpoints(t *testing.T) {
 	const userID = "https://login.microsoftonline.com/5fbc183e-3d09-4043-b36f-0c49d3665977/v2.0.8db0e2eb-d491-4a1a-98f1-cbdc12bb60a0"
 	const clientID = "fa6d79bf-cdaa-495e-8359-78aab7c7cd9b"
-	te, iss, sc := DeriveExternalIdpEndpoints(userID, clientID)
-	if te != "https://login.microsoftonline.com/5fbc183e-3d09-4043-b36f-0c49d3665977/oauth2/v2.0/token" {
-		t.Fatalf("tokenEndpoint: got %q", te)
-	}
-	if iss != "https://login.microsoftonline.com/5fbc183e-3d09-4043-b36f-0c49d3665977/v2.0" {
-		t.Fatalf("issuerURL: got %q", iss)
+	const wantTE = "https://login.microsoftonline.com/5fbc183e-3d09-4043-b36f-0c49d3665977/oauth2/v2.0/token"
+	const wantIss = "https://login.microsoftonline.com/5fbc183e-3d09-4043-b36f-0c49d3665977/v2.0"
+
+	// From userId (Kiro export carries it at account level).
+	te, iss, sc := DeriveExternalIdpEndpoints(userID, clientID, "")
+	if te != wantTE || iss != wantIss {
+		t.Fatalf("from userId: te=%q iss=%q (want %q / %q)", te, iss, wantTE, wantIss)
 	}
 	if !strings.Contains(sc, "api://"+clientID+"/codewhisperer:conversations") || !strings.Contains(sc, "offline_access") {
 		t.Fatalf("scopes: got %q", sc)
 	}
-	// Empty / unparseable userId → all-empty (caller falls back to its 400).
-	if te2, iss2, sc2 := DeriveExternalIdpEndpoints("", clientID); te2 != "" || iss2 != "" || sc2 != "" {
-		t.Fatalf("empty userId should yield all-empty, got %q %q %q", te2, iss2, sc2)
+
+	// From the accessToken JWT issuer (bare blobs carry no userId).
+	jwt := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"`+userID+`"}`)) + "."
+	te2, iss2, sc2 := DeriveExternalIdpEndpoints("", clientID, jwt)
+	if te2 != wantTE || iss2 != wantIss {
+		t.Fatalf("from accessToken JWT: te=%q iss=%q (want %q / %q)", te2, iss2, wantTE, wantIss)
+	}
+	if sc2 == "" {
+		t.Fatalf("scopes from JWT path: got empty")
+	}
+
+	// Neither source → all-empty (caller falls back to its 400).
+	if te3, iss3, sc3 := DeriveExternalIdpEndpoints("", clientID, ""); te3 != "" || iss3 != "" || sc3 != "" {
+		t.Fatalf("empty sources should yield all-empty, got %q %q %q", te3, iss3, sc3)
+	}
+	// userId takes precedence over accessToken.
+	if te4, _, _ := DeriveExternalIdpEndpoints(userID, clientID, jwt); te4 != wantTE {
+		t.Fatalf("userId should take precedence over accessToken, got %q", te4)
 	}
 }

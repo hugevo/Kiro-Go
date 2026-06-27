@@ -548,23 +548,56 @@ func ValidateExternalIdpEndpoint(rawURL string) error {
 	return externalIdpEndpointValidator(rawURL)
 }
 
+// issuerFromAccessTokenJWT decodes an unverified Azure AD access token's payload
+// and returns its iss claim (e.g. https://login.microsoftonline.com/<tenant>/v2.0).
+// No signature verification: this is used only to classify a pasted credential and
+// recover the Azure tenant, never to trust the token itself. Returns "" if
+// accessToken is not a JWT or has no iss.
+func issuerFromAccessTokenJWT(accessToken string) string {
+	raw := strings.TrimSpace(accessToken)
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Iss string `json:"iss"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Iss
+}
+
 // DeriveExternalIdpEndpoints reconstructs the Microsoft / Azure AD token endpoint,
-// OIDC issuer, and default scopes from a Kiro account's userId (which embeds the
-// Azure tenant) and the (constant) Kiro client ID. This lets the credential-import
-// path accept Kiro Account Manager exports, whose credentials block carries
-// refreshToken + clientId but NOT tokenEndpoint/issuerUrl/scopes.
+// OIDC issuer, and default scopes for an external-IdP credential. The Azure tenant
+// is recovered from userId (Kiro Account Manager exports carry it at account
+// level) or, failing that, from the accessToken JWT's issuer (bare blobs with only
+// clientId + accessToken + refreshToken). This lets the credential-import path
+// accept those shapes even though they omit tokenEndpoint/issuerUrl/scopes.
 //
-// userId looks like: https://login.microsoftonline.com/<tenant>/v2.0.<oid>
-// Returns empty strings if userId is empty/unparseable, so the caller can fall
-// back to its "requires clientId and tokenEndpoint" error. The derived
+// userId / iss look like: https://login.microsoftonline.com/<tenant>/v2.0.<oid>
+// Returns empty strings if neither source yields a usable tenant, so the caller
+// can fall back to its "requires clientId and tokenEndpoint" error. The derived
 // tokenEndpoint is re-validated against the IdP allow-list by the caller, so a
 // non-allow-listed host (or the test's http+127.0.0.1 fake) is still gated.
-func DeriveExternalIdpEndpoints(userId, clientID string) (tokenEndpoint, issuerURL, scopes string) {
-	raw := strings.TrimSpace(userId)
-	if raw == "" {
+func DeriveExternalIdpEndpoints(userId, clientID, accessToken string) (tokenEndpoint, issuerURL, scopes string) {
+	src := strings.TrimSpace(userId)
+	if src == "" {
+		// Bare credential blobs carry only clientId + accessToken: recover the
+		// tenant from the access token's JWT issuer.
+		src = strings.TrimSpace(issuerFromAccessTokenJWT(accessToken))
+	}
+	if src == "" {
 		return "", "", ""
 	}
-	u, err := url.Parse(raw)
+	u, err := url.Parse(src)
 	if err != nil || u.Host == "" {
 		return "", "", ""
 	}

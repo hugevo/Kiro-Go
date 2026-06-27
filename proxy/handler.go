@@ -3046,28 +3046,33 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	//（external_idp 带 clientId 但没有 clientSecret），否则会被误判成 social 而 refresh 到错误端点。
 	req.AuthMethod = normalizeImportAuthMethod(req.AuthMethod, req.ClientID, req.ClientSecret, req.TokenEndpoint)
 
+	// Resolve Azure endpoints from userId (Kiro export, account level) or the
+	// accessToken JWT issuer (bare blobs: clientId + token only). A derivation that
+	// also clears the allow-list is itself proof the credential is external_idp —
+	// IdC/social access tokens are not microsoftonline JWTs, so a bare IdC blob (its
+	// iss is an AWS host) won't clear the list and won't be misclassified.
+	derivedTE, derivedIss, derivedSc := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
+	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
+		req.AuthMethod = "external_idp"
+	}
+
 	// external_idp 的 tokenEndpoint 是用户可填的新信任边界：必须经 allow-list 校验，
 	// 否则一份不信任的 credential JSON 可指向内网/攻击者主机，导致 refresh token 被外泄。
 	if req.AuthMethod == "external_idp" {
-		// Kiro Account Manager exports carry refreshToken + clientId (and userId at
-		// account level) but omit tokenEndpoint/issuerUrl/scopes. Derive them from
-		// userId (which embeds the Azure tenant) + the Kiro client ID, then re-validate
-		// against the allow-list below.
-		if req.TokenEndpoint == "" || req.IssuerURL == "" || req.Scopes == "" {
-			te, iss, sc := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID)
-			if req.TokenEndpoint == "" {
-				req.TokenEndpoint = te
-			}
-			if req.IssuerURL == "" {
-				req.IssuerURL = iss
-			}
-			if req.Scopes == "" {
-				req.Scopes = sc
-			}
+		// Kiro Account Manager exports and bare blobs omit tokenEndpoint/issuerUrl/
+		// scopes; fill them from the derived (userId or accessToken-JWT) tenant.
+		if req.TokenEndpoint == "" {
+			req.TokenEndpoint = derivedTE
+		}
+		if req.IssuerURL == "" {
+			req.IssuerURL = derivedIss
+		}
+		if req.Scopes == "" {
+			req.Scopes = derivedSc
 		}
 		if req.ClientID == "" || req.TokenEndpoint == "" {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "external_idp requires clientId and tokenEndpoint (or userId to derive it)"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "external_idp requires clientId and tokenEndpoint (or userId/accessToken to derive it)"})
 			return
 		}
 		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {

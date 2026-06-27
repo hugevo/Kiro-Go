@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"kiro-go/auth"
@@ -409,5 +410,56 @@ func TestApiImportCredentialsExternalIdpDerivesEndpointsFromUserId(t *testing.T)
 	}
 	if got.AccessToken != "at-derived" {
 		t.Fatalf("AccessToken: want at-derived, got %q", got.AccessToken)
+	}
+}
+
+// TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT verifies a bare
+// credential blob (clientId + accessToken + refreshToken, NO authMethod/userId/
+// tokenEndpoint) imports: the accessToken's JWT issuer classifies it as
+// external_idp and yields the tenant to derive the endpoint from. This is the
+// shape of a raw flat credential with no markers.
+func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"at-jwt","refresh_token":"rt-j2","expires_in":3600}`)
+	}))
+	defer fake.Close()
+
+	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restore)
+
+	// Build a fake Azure AD access token whose iss points at the fake server, so the
+	// derived token endpoint hits it. (Signature is irrelevant — we only read iss.)
+	tenant := "5fbc183e-3d09-4043-b36f-0c49d3665977"
+	iss := fake.URL + "/" + tenant + "/v2.0"
+	jwt := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"`+iss+`"}`)) + "."
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	// No authMethod, no userId, no tokenEndpoint — only clientId + accessToken + refreshToken.
+	body := fmt.Sprintf(`{"clientId":"fa6d79bf-cdaa-495e-8359-78aab7c7cd9b","accessToken":%q,"refreshToken":"rt","region":"eu-central-1"}`, jwt)
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	got := config.GetAccounts()[0]
+	if got.AuthMethod != "external_idp" {
+		t.Fatalf("AuthMethod: want external_idp (derived from accessToken JWT), got %q", got.AuthMethod)
+	}
+	wantTE := fake.URL + "/" + tenant + "/oauth2/v2.0/token"
+	if got.TokenEndpoint != wantTE {
+		t.Fatalf("derived TokenEndpoint: want %q, got %q", wantTE, got.TokenEndpoint)
+	}
+	if got.AccessToken != "at-jwt" {
+		t.Fatalf("AccessToken: want at-jwt (refreshed), got %q", got.AccessToken)
 	}
 }
