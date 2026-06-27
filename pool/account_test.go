@@ -402,8 +402,8 @@ func TestHealthAwareScoringPrefersHealthyAccount(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		p.RecordError("failing", false)
 	}
-	p.recordLatency("failing", 5000) // 5s latency
-	p.recordLatency("healthy", 100)  // 100ms latency
+	p.RecordLatency("failing", 5000) // 5s latency
+	p.RecordLatency("healthy", 100)  // 100ms latency
 
 	// Sample 100 selections — healthy should win the majority.
 	healthyCount := 0

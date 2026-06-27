@@ -14,26 +14,81 @@ import (
 const tokenRefreshSkewSeconds int64 = 120
 
 const (
-	circuitClosed          = 0
-	circuitOpen            = 1
-	circuitHalfOpen        = 2
-	circuitErrorThreshold  = 5
-	circuitOpenDuration    = 30 * time.Second
-	sessionAffinityTTL     = 10 * time.Minute
+	circuitClosed         = 0
+	circuitOpen           = 1
+	circuitHalfOpen       = 2
+	circuitErrorThreshold = 5
+	circuitOpenDuration   = 30 * time.Second
+	sessionAffinityTTL    = 10 * time.Minute
+
+	// healthEWMAAlpha is the smoothing factor for the per-account EWMA health
+	// signals (error rate and latency). Higher = react faster to recent events.
+	healthEWMAAlpha = 0.3
+
+	// maxAffinityEntries bounds the session-affinity map; when exceeded, expired
+	// bindings are swept before inserting a new one.
+	maxAffinityEntries = 1024
 )
 
+// circuitBreaker is a per-account 3-state breaker. Its own mutex guards the
+// state transitions so it can be evaluated from the selection path (which only
+// holds the pool's RLock) and still persist open->half-open correctly, instead
+// of silently un-blocking every request once the open window elapses.
 type circuitBreaker struct {
+	mu             sync.Mutex
 	state          int
 	consecutiveErr int
 	openedAt       time.Time
 }
 
+// isOpen reports whether the breaker is currently blocking requests. After the
+// open window elapses it persists the open->half-open transition and returns
+// false to let a single probe through.
+func (cb *circuitBreaker) isOpen(now time.Time) bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case circuitOpen:
+		if now.Sub(cb.openedAt) >= circuitOpenDuration {
+			cb.state = circuitHalfOpen // persist transition; allow one probe
+			return false
+		}
+		return true
+	case circuitHalfOpen:
+		return false
+	default:
+		return false
+	}
+}
+
+// recordError advances the breaker on a failed request.
+func (cb *circuitBreaker) recordError(now time.Time) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.consecutiveErr++
+	if cb.state == circuitHalfOpen {
+		cb.state = circuitOpen // probe failed → re-open
+		cb.openedAt = now
+	} else if cb.consecutiveErr >= circuitErrorThreshold && cb.state == circuitClosed {
+		cb.state = circuitOpen
+		cb.openedAt = now
+	}
+}
+
+// reset closes the breaker after a successful request.
+func (cb *circuitBreaker) reset() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.state = circuitClosed
+	cb.consecutiveErr = 0
+}
+
 // accountHealth tracks per-account health signals used by score-weighted
-// selection: EWMA latency plus success/error counts.
+// selection: EWMA latency and a decaying EWMA error rate.
 type accountHealth struct {
-	ewmaLatencyMs float64 // EWMA latency (α=0.3)
-	successCount  int
-	errorCount    int
+	ewmaLatencyMs float64 // EWMA latency (α=healthEWMAAlpha)
+	ewmaErrorRate float64 // EWMA error rate in [0,1]; 1 per error, 0 per success
+	samples       int     // number of recorded observations
 }
 
 // apiKeyBinding binds an API key to a preferred account for session affinity.
@@ -43,49 +98,15 @@ type apiKeyBinding struct {
 }
 
 // isCircuitOpen reports whether an account's circuit breaker is currently open
-// (and should be skipped). It also transitions open→half-open after the open
-// duration elapses, allowing a single probe request through.
+// (and should be skipped). It transitions open→half-open after the open
+// duration elapses, allowing a single probe through. Safe to call without
+// holding p.mu — it takes its own RLock for the map read, and the breaker's own
+// mutex guards the state transition.
 func (p *AccountPool) isCircuitOpen(id string, now time.Time) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	cb, ok := p.circuitState[id]
-	if !ok || cb == nil {
-		return false
-	}
-	switch cb.state {
-	case circuitOpen:
-		if now.Sub(cb.openedAt) >= circuitOpenDuration {
-			cb.state = circuitHalfOpen // transition to half-open after timeout
-			return false               // allow one probe
-		}
-		return true
-	case circuitHalfOpen:
-		return false // allow the probe through
-	default:
-		return false
-	}
-}
-
-// isCircuitOpenLocked is a lock-free variant for use while the caller already
-// holds p.mu (e.g. inside GetNextForModelExcluding, which holds the RLock).
-// Calling p.mu.Lock() from inside a held RLock deadlocks, so selection paths
-// use this read-only check instead. The open→half-open transition happens via
-// isCircuitOpen (external callers); here we simply allow a probe through once
-// the open duration has elapsed.
-func (p *AccountPool) isCircuitOpenLocked(id string, now time.Time) bool {
-	cb, ok := p.circuitState[id]
-	if !ok || cb == nil {
-		return false
-	}
-	switch cb.state {
-	case circuitOpen:
-		if now.Sub(cb.openedAt) >= circuitOpenDuration {
-			return false // half-open transition
-		}
-		return true
-	default:
-		return false
-	}
+	p.mu.RLock()
+	cb := p.circuitState[id]
+	p.mu.RUnlock()
+	return cb != nil && cb.isOpen(now)
 }
 
 // AccountPool 账号池
@@ -240,7 +261,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 			continue
 		}
-		if p.isCircuitOpenLocked(acc.ID, now) {
+		if cb := p.circuitState[acc.ID]; cb != nil && cb.isOpen(now) {
 			continue
 		}
 		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
@@ -319,10 +340,24 @@ func (p *AccountPool) GetNextForModelWithApiKey(model string, excluded map[strin
 	acc := p.GetNextForModelExcluding(model, excluded)
 	if acc != nil && apiKey != "" && config.GetSessionAffinityEnabled() {
 		p.mu.Lock()
+		if len(p.apiKeyAffinity) >= maxAffinityEntries {
+			p.pruneExpiredAffinityLocked(time.Now())
+		}
 		p.apiKeyAffinity[apiKey] = apiKeyBinding{accountID: acc.ID, lastUsed: time.Now()}
 		p.mu.Unlock()
 	}
 	return acc
+}
+
+// pruneExpiredAffinityLocked removes session-affinity bindings whose TTL has
+// elapsed, keeping the map from growing unbounded with one entry per distinct
+// API key ever seen. Caller must hold p.mu (write lock).
+func (p *AccountPool) pruneExpiredAffinityLocked(now time.Time) {
+	for key, binding := range p.apiKeyAffinity {
+		if now.Sub(binding.lastUsed) >= sessionAffinityTTL {
+			delete(p.apiKeyAffinity, key)
+		}
+	}
 }
 
 // RecordSuccess 记录请求成功，清除冷却
@@ -332,57 +367,62 @@ func (p *AccountPool) RecordSuccess(id string) {
 	delete(p.cooldowns, id)
 	p.errorCounts[id] = 0
 	// Circuit breaker: reset on success.
-	if cb, ok := p.circuitState[id]; ok && cb != nil {
-		cb.state = circuitClosed
-		cb.consecutiveErr = 0
+	if cb := p.circuitState[id]; cb != nil {
+		cb.reset()
 	}
-	// Health stats: record success.
-	if h, ok := p.healthStats[id]; ok && h != nil {
-		h.successCount++
-		h.errorCount = 0
-	}
+	// Health stats: a success decays the error rate toward 0 without erasing
+	// recent failures (so a previously-flapping account stays slightly penalised).
+	p.recordHealthObservation(id, false)
 }
 
 // RecordError 记录请求错误，设置冷却
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 
 	p.errorCounts[id]++
 
 	if isQuotaError {
 		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
+		p.cooldowns[id] = now.Add(time.Hour)
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = time.Now().Add(time.Minute)
+		p.cooldowns[id] = now.Add(time.Minute)
 	}
 
 	// Circuit breaker: track consecutive errors.
 	cb := p.circuitState[id]
 	if cb == nil {
-		cb = &circuitBreaker{state: circuitClosed}
+		cb = &circuitBreaker{}
+		if p.circuitState == nil {
+			p.circuitState = make(map[string]*circuitBreaker)
+		}
 		p.circuitState[id] = cb
 	}
-	cb.consecutiveErr++
-	if cb.state == circuitHalfOpen {
-		// Probe failed → re-open.
-		cb.state = circuitOpen
-		cb.openedAt = time.Now()
-	} else if cb.consecutiveErr >= circuitErrorThreshold && cb.state == circuitClosed {
-		cb.state = circuitOpen
-		cb.openedAt = time.Now()
+	cb.recordError(now)
+
+	// Health stats: raise the EWMA error rate.
+	p.recordHealthObservation(id, true)
+}
+
+// recordHealthObservation updates the account's EWMA error rate. isError=true
+// pushes the rate toward 1, false decays it toward 0. Caller must hold p.mu.
+func (p *AccountPool) recordHealthObservation(id string, isError bool) {
+	if p.healthStats == nil {
+		p.healthStats = make(map[string]*accountHealth)
 	}
-	// Health stats: record error (create entry so errorRate is accurate).
-	// Guard against nil healthStats (test pools may leave it uninitialized).
-	if p.healthStats != nil {
-		h := p.healthStats[id]
-		if h == nil {
-			h = &accountHealth{}
-			p.healthStats[id] = h
-		}
-		h.errorCount++
+	h := p.healthStats[id]
+	if h == nil {
+		h = &accountHealth{}
+		p.healthStats[id] = h
 	}
+	h.samples++
+	sample := 0.0
+	if isError {
+		sample = 1.0
+	}
+	h.ewmaErrorRate = healthEWMAAlpha*sample + (1-healthEWMAAlpha)*h.ewmaErrorRate
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
@@ -594,11 +634,15 @@ func effectiveWeight(weight int) int {
 	return weight
 }
 
-// recordLatency records an observed request latency into the account's EWMA
-// (α=0.3). Called from request handlers after a response completes.
-func (p *AccountPool) recordLatency(id string, latencyMs float64) {
+// RecordLatency records an observed request latency into the account's EWMA
+// (α=healthEWMAAlpha). Called from request handlers after a response completes
+// so health-aware selection can prefer faster accounts.
+func (p *AccountPool) RecordLatency(id string, latencyMs float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.healthStats == nil {
+		p.healthStats = make(map[string]*accountHealth)
+	}
 	h := p.healthStats[id]
 	if h == nil {
 		h = &accountHealth{}
@@ -607,12 +651,15 @@ func (p *AccountPool) recordLatency(id string, latencyMs float64) {
 	if h.ewmaLatencyMs == 0 {
 		h.ewmaLatencyMs = latencyMs
 	} else {
-		h.ewmaLatencyMs = 0.3*latencyMs + 0.7*h.ewmaLatencyMs
+		h.ewmaLatencyMs = healthEWMAAlpha*latencyMs + (1-healthEWMAAlpha)*h.ewmaLatencyMs
+	}
+	if h.samples == 0 {
+		h.samples = 1 // a latency observation counts as evidence for scoring
 	}
 }
 
 // healthScore returns a selection weight for the account: higher = preferred.
-// score = effectiveWeight × (1 - errorRate) × (1 / (1 + latency/1000))
+// score = effectiveWeight × (1 - ewmaErrorRate) × (1 / (1 + latency/1000))
 // Lock-free: the caller (GetNextForModelExcluding) already holds p.mu RLock.
 func (p *AccountPool) healthScore(id string, weight int) float64 {
 	w := float64(weight)
@@ -620,16 +667,11 @@ func (p *AccountPool) healthScore(id string, weight int) float64 {
 		w = 1
 	}
 	h := p.healthStats[id]
-	if h == nil {
+	if h == nil || h.samples == 0 {
 		return w // no data → default weight
 	}
-	total := h.successCount + h.errorCount
-	if total == 0 {
-		return w
-	}
-	errorRate := float64(h.errorCount) / float64(total)
 	latencyFactor := 1.0 / (1.0 + h.ewmaLatencyMs/1000.0)
-	return w * (1.0 - errorRate) * latencyFactor
+	return w * (1.0 - h.ewmaErrorRate) * latencyFactor
 }
 
 // fallbackEarliestCooldown returns the account with the earliest cooldown
@@ -663,7 +705,7 @@ func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string
 
 // startAutoRecover launches a background goroutine that periodically refreshes
 // disabled accounts' tokens. If a refresh succeeds, the account is re-enabled.
-// Exponential backoff per account: 1m → 5m → 30m → max 2h.
+// Exponential backoff per account: 1m → 5m → 25m → max 2h.
 func (p *AccountPool) startAutoRecover() {
 	p.stopRecover = make(chan struct{})
 	go func() {
@@ -712,7 +754,7 @@ func (p *AccountPool) reprobeDisabled() {
 			p.mu.Unlock()
 			continue
 		}
-		// Failure → increase backoff: 1m → 5m → 30m → 2h max.
+		// Failure → increase backoff: 1m → 5m → 25m → 2h max.
 		if backoff == 0 {
 			backoff = time.Minute
 		} else {
