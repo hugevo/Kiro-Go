@@ -492,17 +492,18 @@ func IsAuthFailure(err error) bool {
 	return false
 }
 
-// hasStatusToken returns true when status appears in s with non-digit boundaries
-// on both sides, so "401" matches "HTTP 401 from ..." but not "request_401abc".
+// hasStatusToken returns true when status appears in s with non-alphanumeric
+// boundaries on both sides, so "401" matches "HTTP 401 from ..." but not
+// "4011", "14013", or an alphanumeric token like "request_401abc".
 func hasStatusToken(s, status string) bool {
 	for {
 		idx := strings.Index(s, status)
 		if idx < 0 {
 			return false
 		}
-		leftOK := idx == 0 || !isDigit(s[idx-1])
+		leftOK := idx == 0 || !isAlphaNum(s[idx-1])
 		rightIdx := idx + len(status)
-		rightOK := rightIdx >= len(s) || !isDigit(s[rightIdx])
+		rightOK := rightIdx >= len(s) || !isAlphaNum(s[rightIdx])
 		if leftOK && rightOK {
 			return true
 		}
@@ -512,6 +513,10 @@ func hasStatusToken(s, status string) bool {
 
 func isDigit(b byte) bool {
 	return b >= '0' && b <= '9'
+}
+
+func isAlphaNum(b byte) bool {
+	return isDigit(b) || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 // IsSuspensionError reports whether the error indicates the account has been
