@@ -160,10 +160,13 @@ func GetPool() *AccountPool {
 // Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
 // setting permits over-quota routing.
 func (p *AccountPool) Reload() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// Read config (takes cfgLock) BEFORE acquiring p.mu so the pool lock never
+	// nests cfgLock — see GetNextForModelExcluding for the ordering rationale.
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	var accounts []config.Account
 	for _, a := range enabled {
 		if isQuotaBlocked(a, allowOverUsage) {
@@ -240,6 +243,13 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 // excluded, cooled-down, circuit-open, token-expiring, and quota-blocked
 // accounts. model="" means "any model".
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
+	// Read config (takes cfgLock) BEFORE acquiring p.mu so the pool lock never
+	// nests cfgLock. Holding p.mu while blocking on cfgLock would freeze every
+	// other pool operation behind the write lock if a config writer is mid-Save
+	// (synchronous os.WriteFile). Keeping cfgLock a strict leaf preserves the
+	// global order tokenRefreshMu → p.mu → refreshLockFor → cfgLock.
+	allowOverUsage := config.GetAllowOverUsage()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -247,7 +257,6 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		return nil
 	}
 
-	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 
 	// Build candidate list: each eligible account paired with its last
