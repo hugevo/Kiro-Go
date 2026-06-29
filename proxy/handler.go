@@ -1952,6 +1952,25 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
+			// Stream already started: cannot retry or send a JSON error. Terminate
+			// the SSE with a finish chunk so the client sees the failure instead of a
+			// silent truncation (mirrors handleClaudeStream's error SSE and
+			// handleResponsesStream's response.failed).
+			errChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "error",
+				}},
+			}
+			errData, _ := json.Marshal(errChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(errData))
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			h.recordFailureWithDetails("openai", model, account.ID, err)
 			return
 		}
