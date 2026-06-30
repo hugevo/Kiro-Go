@@ -11,13 +11,19 @@ import (
 const maxAccountRetryAttempts = 3
 
 func isQuotaErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+	lower := strings.ToLower(msg)
+	// Match the 429 status code only as a digit-boundary token (parity with
+	// pool.HasStatusToken used by the auth classifier) so a stray "429" inside
+	// an upstream body token/ID can't false-trigger RecordError(true). "quota"
+	// remains a word marker.
+	return pool.HasStatusToken(lower, "429") || strings.Contains(lower, "quota")
 }
 
 func isOverageErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
+	lower := strings.ToLower(msg)
+	// 402 must be a digit-boundary token, not an arbitrary substring (parity
+	// with pool.HasStatusToken), ANDed with the "overage" word marker.
+	return pool.HasStatusToken(lower, "402") && strings.Contains(lower, "overage")
 }
 
 func isSuspensionErrorMessage(msg string) bool {

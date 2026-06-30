@@ -82,3 +82,47 @@ func TestHandleAccountFailureBansOnGenuineAuthError(t *testing.T) {
 		t.Fatalf("genuine auth error should ban the account; got enabled=%v banStatus=%q", got.Enabled, got.BanStatus)
 	}
 }
+
+// TestQuotaClassifierStatusTokenBoundary verifies isQuotaErrorMessage matches a
+// genuine "429" status code but NOT a stray "429" substring embedded in an
+// upstream body token/ID — parity with pool.HasStatusToken (the auth-classifier
+// hardening in 3276727). Before routing the digit through HasStatusToken, a body
+// like "request 1429abc failed" false-triggered RecordError(true) → soft cooldown.
+func TestQuotaClassifierStatusTokenBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{name: "genuine status", msg: "HTTP 429: quota exhausted", want: true},
+		{name: "word marker", msg: "usage quota exceeded", want: true},
+		{name: "stray 429 in token", msg: "request id 1429abc failed", want: false},
+		{name: "stray 429 in hex id", msg: "trace 4290f3: upstream unavailable", want: false},
+	}
+	for _, tc := range tests {
+		if got := isQuotaErrorMessage(tc.msg); got != tc.want {
+			t.Fatalf("isQuotaErrorMessage(%q) = %v, want %v [%s]", tc.msg, got, tc.want, tc.name)
+		}
+	}
+}
+
+// TestOverageClassifierStatusTokenBoundary verifies isOverageErrorMessage
+// requires "402" as a digit-boundary token (parity with pool.HasStatusToken), so
+// a stray "402" inside a body token can't combine with the word "overage" to
+// false-fire disableAccountOverage. The genuine upstream format from
+// upstreamError(402,…) — "HTTP 402 overage from …" — still matches.
+func TestOverageClassifierStatusTokenBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{name: "genuine upstream format", msg: "HTTP 402 overage from primary: Usage limit exceeded", want: true},
+		{name: "stray 402 in token", msg: "overage noted in region abc402xyz", want: false},
+	}
+	for _, tc := range tests {
+		if got := isOverageErrorMessage(tc.msg); got != tc.want {
+			t.Fatalf("isOverageErrorMessage(%q) = %v, want %v [%s]", tc.msg, got, tc.want, tc.name)
+		}
+	}
+}
