@@ -150,3 +150,50 @@ func TestAffinityRespectsQuotaBlock(t *testing.T) {
 		t.Fatalf("affinity must skip a quota-blocked bound account; got %#v", acc)
 	}
 }
+
+// TestRecordErrorDoesNotShortenQuotaCooldown verifies a transient (non-quota)
+// error reaching errorCounts>=3 does NOT clobber a longer existing quota cooldown
+// (+1h) with the short +1min transient backoff. A quota-exhausted account must
+// stay backed off for the full hour regardless of subsequent generic errors, or
+// it becomes selectable again after one minute and re-hammers the exhausted
+// upstream. RecordError must assign cooldowns monotonically (never shorten).
+func TestRecordErrorDoesNotShortenQuotaCooldown(t *testing.T) {
+	p := healthPool(config.Account{ID: "a", Enabled: true})
+
+	p.RecordError("a", true) // quota → cooldown now + 1h
+	quotaExpiry := p.cooldowns["a"]
+
+	p.RecordError("a", false) // errorCounts 2
+	p.RecordError("a", false) // errorCounts 3 → transient +1min branch (must NOT shorten the 1h)
+
+	got := p.cooldowns["a"]
+	if got.Before(quotaExpiry) {
+		t.Fatalf("transient 3-error cooldown shortened the quota cooldown: quota=%v got=%v", quotaExpiry, got)
+	}
+	// A transient +1min clobber would land ~59min sooner; the real 1h backoff
+	// must still be more than 30min out.
+	if !got.After(time.Now().Add(30 * time.Minute)) {
+		t.Fatalf("quota cooldown was clobbered to a short transient backoff; got %v", got)
+	}
+}
+
+// TestRecordSuccessDoesNotWipeQuotaCooldown verifies a late in-flight success
+// (a request dispatched before the quota hit, completing after) does NOT wipe
+// the protective quota cooldown via RecordSuccess's blanket delete(cooldowns).
+// Only transient (3-error, +1min) cooldowns should clear on success; a quota/
+// overage backoff must persist to its natural expiry or the exhausted upstream
+// gets re-selected immediately.
+func TestRecordSuccessDoesNotWipeQuotaCooldown(t *testing.T) {
+	p := healthPool(config.Account{ID: "a", Enabled: true})
+
+	p.RecordError("a", true) // quota → +1h hard cooldown
+	p.RecordSuccess("a")     // a late in-flight success
+
+	cd, ok := p.cooldowns["a"]
+	if !ok {
+		t.Fatal("RecordSuccess must not wipe a hard (quota) cooldown on a late in-flight success")
+	}
+	if !cd.After(time.Now().Add(30 * time.Minute)) {
+		t.Fatalf("quota cooldown wiped/shortened by RecordSuccess; got %v", cd)
+	}
+}

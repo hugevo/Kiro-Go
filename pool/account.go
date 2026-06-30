@@ -439,7 +439,15 @@ func (p *AccountPool) pruneExpiredAffinityLocked(now time.Time) {
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.cooldowns, id)
+	// Don't wipe a hard (quota/overage/disable) backoff on a late in-flight
+	// success — only clear transient (3-error, +1min) cooldowns. A quota backoff
+	// (+1h) must persist to its natural expiry or the exhausted upstream gets
+	// re-selected immediately.
+	if cd, ok := p.cooldowns[id]; ok && time.Until(cd) > cooldownClearThreshold {
+		// keep the hard cooldown
+	} else {
+		delete(p.cooldowns, id)
+	}
 	p.errorCounts[id] = 0
 	// Circuit breaker: reset on success.
 	if cb := p.circuitState[id]; cb != nil {
@@ -448,6 +456,22 @@ func (p *AccountPool) RecordSuccess(id string) {
 	// Health stats: a success decays the error rate toward 0 without erasing
 	// recent failures (so a previously-flapping account stays slightly penalised).
 	p.recordHealthObservation(id, false)
+}
+
+// cooldownClearThreshold is the remaining duration below which RecordSuccess
+// will clear a cooldown. Transient (3-error) cooldowns are +1min; quota/overage
+// backoffs are +1h. A late in-flight success must not wipe a hard backoff —
+// only short transient ones — or the exhausted upstream gets re-selected.
+const cooldownClearThreshold = 10 * time.Minute
+
+// setCooldownIfLater sets the cooldown to newExpiry only if it extends the
+// existing one (or none exists), so a transient short backoff (the 3-error
+// +1min cooldown) can never shorten a longer quota/overage backoff (+1h) for
+// the same account. Caller must hold p.mu.
+func setCooldownIfLater(cooldowns map[string]time.Time, id string, newExpiry time.Time) {
+	if ex, ok := cooldowns[id]; !ok || newExpiry.After(ex) {
+		cooldowns[id] = newExpiry
+	}
 }
 
 // RecordError 记录请求错误，设置冷却
@@ -459,11 +483,11 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = now.Add(time.Hour)
+		// 配额错误，冷却 1 小时（不缩短已有的更长冷却）
+		setCooldownIfLater(p.cooldowns, id, now.Add(time.Hour))
 	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = now.Add(time.Minute)
+		// 连续 3 次错误，冷却 1 分钟（不缩短已有的更长冷却）
+		setCooldownIfLater(p.cooldowns, id, now.Add(time.Minute))
 	}
 
 	// Circuit breaker: track consecutive errors.
