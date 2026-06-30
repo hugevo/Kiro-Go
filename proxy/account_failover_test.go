@@ -126,3 +126,30 @@ func TestOverageClassifierStatusTokenBoundary(t *testing.T) {
 		}
 	}
 }
+
+// TestShouldRetryAccountRefreshOnErrorStatusTokenBoundary verifies the admin
+// refresh retry trigger matches genuine 401/403 status codes by digit boundary
+// (parity with pool.HasStatusToken used by the ban classifiers), so a stray
+// "401"/"403" inside an upstream token/ID can't cause a spurious token-refresh +
+// retry. Word markers "invalid"/"expired" are unchanged. This is a RETRY trigger
+// (handler.go refresh-account endpoint), not a ban classifier.
+func TestShouldRetryAccountRefreshOnErrorStatusTokenBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{name: "genuine 401", msg: "HTTP 401 from primary: unauthorized", want: true},
+		{name: "genuine 403", msg: "upstream error (status 403): forbidden", want: true},
+		{name: "token expired", msg: "token expired", want: true},
+		{name: "invalid grant", msg: "invalid_grant from idp", want: true},
+		{name: "stray 401 in token", msg: "trace 14013ab failed", want: false},
+		{name: "stray 403 in hex id", msg: "request 4030f3 timed out", want: false},
+		{name: "unrelated error", msg: "dial tcp: connection refused", want: false},
+	}
+	for _, tc := range tests {
+		if got := shouldRetryAccountRefreshOnError(tc.msg); got != tc.want {
+			t.Fatalf("shouldRetryAccountRefreshOnError(%q) = %v, want %v [%s]", tc.msg, got, tc.want, tc.name)
+		}
+	}
+}

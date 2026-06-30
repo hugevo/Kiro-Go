@@ -3553,7 +3553,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		}
 
 		// 如果是 403/401，说明 token 无效，尝试刷新后重试
-		if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
+		if shouldRetryAccountRefreshOnError(errMsg) {
 			if refreshErr := refreshTokenIfNeeded(); refreshErr == nil {
 				// 重试
 				info, err = RefreshAccountInfo(account)

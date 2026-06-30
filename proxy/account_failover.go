@@ -38,6 +38,19 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 	return strings.Contains(msg, "no available kiro profile")
 }
 
+// shouldRetryAccountRefreshOnError reports whether a RefreshAccountInfo error
+// looks like a stale/invalid token worth one token-refresh + retry in the admin
+// "refresh account" endpoint (handler.go). This is a RETRY trigger, NOT a ban
+// classifier — a false positive only costs a redundant refresh + retry. Status
+// codes 401/403 are matched by digit boundary (pool.HasStatusToken) for parity
+// with the ban classifiers, so a stray digit in a request ID/token can't fire a
+// spurious refresh+retry; "invalid"/"expired" remain word markers.
+func shouldRetryAccountRefreshOnError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return pool.HasStatusToken(lower, "401") || pool.HasStatusToken(lower, "403") ||
+		strings.Contains(lower, "invalid") || strings.Contains(lower, "expired")
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
