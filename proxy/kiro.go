@@ -301,6 +301,17 @@ func upstreamError(statusCode int, endpoint, body string) error {
 	return fmt.Errorf("HTTP %d from %s: %s", statusCode, endpoint, body)
 }
 
+// parseAndStream wraps parseEventStream so CallKiroAPI's 200 path can defer the
+// upstream body close (closing even on a callback panic, so the TCP connection
+// is returned to the transport pool instead of leaking). Without the defer, a
+// panic in OnText/OnToolUse/parseEventStream unwinds past a plain Close and
+// leaks the connection (repeated panics exhaust MaxIdleConnsPerHost=20 / FDs;
+// net/http's per-request recover catches the panic but the body stays open).
+func parseAndStream(body io.ReadCloser, callback *KiroStreamCallback) error {
+	defer body.Close()
+	return parseEventStream(body, callback)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
@@ -408,9 +419,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
-		return err
+		// parseAndStream defers resp.Body.Close(), so a panic in a streaming
+		// callback (OnText/OnToolUse/parseEventStream) still returns the upstream
+		// TCP connection to the transport pool instead of leaking it.
+		return parseAndStream(resp.Body, callback)
 	}
 
 	if lastErr != nil {
