@@ -34,8 +34,10 @@ var (
 	// held for the duration of one refresh.
 	refreshMu sync.Mutex
 	// refreshLocks maps accountID → that account's refresh mutex. One lock per
-	// account serializes only that account's refreshes, replacing the old global
-	// handler-level tokenRefreshMu which serialized every account (a bottleneck).
+	// account serializes only that account's background refreshes, reducing the
+	// global contention the handler-level tokenRefreshMu imposed. tokenRefreshMu
+	// still guards the request-path refresh (handler.go:2148) and remains part of
+	// the documented lock order (account.go:250) — intentionally not removed.
 	// Account IDs are stable UUIDs; the map is bounded by the total number of
 	// accounts ever seen, which is negligible for this deployment.
 	refreshLocks = map[string]*sync.Mutex{}
