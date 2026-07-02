@@ -1265,7 +1265,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
+		//   branch off main. No-op here; stripped so handler compiles against main's
+		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1534,7 +1537,10 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
+		//   branch off main. No-op here; stripped so handler compiles against main's
+		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1983,7 +1989,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
+		//   branch off main. No-op here; stripped so handler compiles against main's
+		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -2089,7 +2098,10 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
+		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
+		//   branch off main. No-op here; stripped so handler compiles against main's
+		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
