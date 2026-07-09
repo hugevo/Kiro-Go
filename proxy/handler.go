@@ -11,6 +11,7 @@ import (
 	"kiro-go/pool"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2292,6 +2293,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
 		h.apiUpdatePromptFilter(w, r)
+	case path == "/kiro-client" && r.Method == "GET":
+		h.apiGetKiroClientConfig(w, r)
+	case path == "/kiro-client" && r.Method == "POST":
+		h.apiUpdateKiroClientConfig(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -3857,6 +3862,69 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		config.UpdateEndpointFallback(*req.EndpointFallback)
 	}
 
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// kiroBuildHashRe validates that a user-supplied build hash is a bare 64-hex
+// string (SHA-256 output). The real Kiro client sends this format, so anything
+// else (e.g. a UUID with dashes) would stand out in the User-Agent.
+var kiroBuildHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func (h *Handler) apiGetKiroClientConfig(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(config.GetKiroClientSettings())
+}
+
+// apiUpdateKiroClientConfig 更新 Kiro 客户端配置（版本号 + build hash 映射）
+func (h *Handler) apiUpdateKiroClientConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		KiroVersion   *string           `json:"kiroVersion,omitempty"`
+		SystemVersion *string           `json:"systemVersion,omitempty"`
+		NodeVersion   *string           `json:"nodeVersion,omitempty"`
+		BuildHashes   map[string]string `json:"buildHashes,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// Validate every user-supplied hash is a bare 64-hex string. Built-in
+	// defaults have already been validated at the code level; the UI merges them
+	// in when sending, so an invalid value here is a user-typed (not builtin)
+	// one and must be rejected.
+	for ver, hash := range req.BuildHashes {
+		if !kiroBuildHashRe.MatchString(hash) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("Invalid build hash for %q: must be 64 hex characters", ver),
+			})
+			return
+		}
+	}
+
+	// Current values as fallbacks so a partial update does not blank out fields.
+	current := config.GetKiroClientSettings()
+	kiroVersion := current.KiroVersion
+	systemVersion := current.SystemVersion
+	nodeVersion := current.NodeVersion
+	if req.KiroVersion != nil {
+		kiroVersion = *req.KiroVersion
+	}
+	if req.SystemVersion != nil {
+		systemVersion = *req.SystemVersion
+	}
+	if req.NodeVersion != nil {
+		nodeVersion = *req.NodeVersion
+	}
+	// A nil BuildHashes from the UI means "don't touch"; an empty map means
+	// "remove all user overrides". Default to nil so omission is a no-op.
+	overrides := req.BuildHashes
+
+	if err := config.UpdateKiroClientSettings(kiroVersion, systemVersion, nodeVersion, overrides); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 

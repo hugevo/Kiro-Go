@@ -12,12 +12,29 @@ If this project helps you, a Star would mean a lot.
 
 ## Features
 
-- Anthropic `/v1/messages` & OpenAI `/v1/chat/completions`
-- Multi-account pool with round-robin load balancing
-- Auto token refresh, SSE streaming, Web admin panel
-- Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), SSO Token, local cache, credentials JSON
-- Usage tracking, account import/export, i18n (CN / EN)
-- Support configuring outbound proxy (SOCKS5 / HTTP)
+- **Compatible API surface** — Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and OpenAI `/v1/responses` (with `previous_response_id` chaining), plus `/v1/models`, `/v1/messages/count_tokens`, and `/v1/stats`
+- **Multi-account pool** — weighted round-robin selection, model-aware routing, automatic token refresh, and failover (quota / overage / suspension / auth classification) across Kiro IDE, CodeWhisperer, and Amazon Q endpoints
+- **SSE streaming** — long streams are never server-killed (`WriteTimeout=0`)
+- **Web admin panel** — Accounts, Settings, API docs, and Logs tabs, with privacy mode, batch ops, export, and search; i18n (CN / EN)
+- **Multiple auth methods** — AWS Builder ID, IAM Identity Center (Enterprise SSO), hosted Kiro sign-in (Google / GitHub / Microsoft 365 / Entra ID / Azure AD), SSO Token paste, credentials JSON paste
+- **Prompt-cache accounting** — Anthropic-style `cache_creation` / `cache_read` token estimation with cross-account sharing, disk persistence, and metrics on `/v1/stats`
+- **Prompt sanitization** — Claude Code system-prompt filter, env-noise strip, boundary-marker strip, custom regex filters
+- **Thinking mode** — via `-thinking` model suffix or a top-level `thinking` config block
+- **Usage tracking & account import/export**
+- **Outbound proxy** — SOCKS5 / HTTP, hot-reconfigurable without restart
+- **Single static binary** — one external Go dependency (`github.com/google/uuid`), JSON config, one data volume
+
+## Architecture
+
+Kiro-Go is a single-process reverse proxy: a Claude or OpenAI client talks to one local HTTP server, which translates requests into Kiro's internal payload format, dispatches them across a pool of upstream accounts with automatic failover and token refresh, and streams results back.
+
+For full diagrams and design docs see [`docs/`](docs):
+
+- [Project Overview & Requirements](docs/project-overview-pdr.md)
+- [Codebase Summary](docs/codebase-summary.md)
+- [System Architecture](docs/system-architecture.md)
+- [Deployment Guide](docs/deployment-guide.md)
+- [Code Standards](docs/code-standards.md) · [Design Guidelines](docs/design-guidelines.md) · [Roadmap](docs/project-roadmap.md)
 
 ## Quick Start
 
@@ -111,7 +128,11 @@ The setting takes effect immediately without restarting.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
-| `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `ADMIN_PASSWORD` | Admin panel password (overrides config) | `changeme` |
+| `LOG_LEVEL` | Log verbosity: `DEBUG` / `INFO` / `WARN` / `ERROR` (overrides config) | `info` |
+| `KIRO_SSO_CALLBACK_BIND` | Bind interface for the Enterprise SSO loopback listener (port `3128`) | loopback |
+
+See the [Deployment Guide](docs/deployment-guide.md) for ports (`8080` API/admin, `3128` Enterprise SSO callback), the `data/` volume, and security hardening.
 
 ## Contributing
 

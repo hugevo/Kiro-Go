@@ -12,6 +12,8 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -23,6 +25,9 @@ import (
 // GenerateMachineId generates a UUID v4 format machine identifier.
 // This ID is used to uniquely identify the proxy instance in Kiro API requests,
 // helping with request tracking and rate limiting on the server side.
+//
+// NOTE: this is only used for internal account tracking / admin display, NOT for
+// the User-Agent suffix sent to Kiro. See KiroBuildHash / ResolveKiroBuildHash.
 func GenerateMachineId() string {
 	bytes := make([]byte, 16)
 	rand.Read(bytes)
@@ -30,6 +35,58 @@ func GenerateMachineId() string {
 	bytes[8] = (bytes[8] & 0x3f) | 0x80 // 变体
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16])
+}
+
+// kiroBuildHashes maps a Kiro IDE version to the build hash that the real Kiro
+// client appends to its User-Agent as `KiroIDE-<version>-<hash>`.
+//
+// Unlike a per-install machine ID, this value is FIXED for every user running
+// the same version (it is a content/git hash baked into the build, not a random
+// per-machine identifier). Sending a random UUID in this position is a strong
+// fingerprinting signal, so we reproduce the exact hash the real client sends.
+//
+// MAINTENANCE: each time Kiro ships a new version we claim to support, capture
+// the hash from a real client's User-Agent header and add it here. A missing
+// version falls back to ResolveKiroBuildHash (see below).
+var kiroBuildHashes = map[string]string{
+	"0.12.333": "2ecd375f32fb815800ae42b778607b3a4cb0ef89208f4d12b13080ede8c29795",
+}
+
+// ResolveKiroBuildHash returns the build hash to append after `KiroIDE-<version>`
+// in the User-Agent. Resolution order (highest priority first):
+//  1. Per-account override (account.HashSuffix, when set, allows pinning a captured hash)
+//  2. User-configured override from the admin UI (cfg.KiroBuildHashOverrides[ver])
+//  3. Built-in known-hash table (kiroBuildHashes) — cannot be removed via the UI
+//  4. Stable per-version fallback so the value never looks like a random UUID even
+//     for versions that have not been catalogued yet
+func ResolveKiroBuildHash(kiroVersion, override string) string {
+	if override != "" {
+		return override
+	}
+	cfgLock.RLock()
+	var uiHash string
+	if cfg != nil {
+		uiHash = cfg.KiroBuildHashOverrides[kiroVersion]
+	}
+	cfgLock.RUnlock()
+	if uiHash != "" {
+		return uiHash
+	}
+	if h, ok := kiroBuildHashes[kiroVersion]; ok {
+		return h
+	}
+	// Unknown version: derive a stable 64-hex value so the suffix still matches
+	// the real client's FORMAT (bare hex, no dashes) rather than a UUID. This is
+	// a best-effort shape match; replace it with the real hash once captured.
+	return stableFallbackHash("kiro-build-" + kiroVersion)
+}
+
+// stableFallbackHash derives a deterministic 64-char hex string from input.
+// Used only for Kiro versions whose real build hash has not been captured yet,
+// so the User-Agent suffix keeps the correct shape (bare hex) instead of a UUID.
+func stableFallbackHash(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:])
 }
 
 // Account represents a Kiro API account with authentication credentials and usage statistics.
@@ -51,6 +108,7 @@ type Account struct {
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
+	HashSuffix   string `json:"hashSuffix,omitempty"`   // Optional override for the KiroIDE-<ver>-<hash> User-Agent suffix (defaults to the known build hash for the version)
 	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
 
 	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
@@ -163,6 +221,13 @@ type Config struct {
 	KiroVersion   string        `json:"kiroVersion,omitempty"`
 	SystemVersion string        `json:"systemVersion,omitempty"`
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
+
+	// KiroBuildHashOverrides maps a Kiro IDE version to the build hash the admin
+	// configured from the UI. These sit on top of the built-in kiroBuildHashes
+	// table (which is a default that cannot be removed via the UI) and are only
+	// used when the per-account HashSuffix is not set. Used to build the
+	// KiroIDE-<version>-<hash> User-Agent suffix that the real Kiro client sends.
+	KiroBuildHashOverrides map[string]string `json:"kiroBuildHashes,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
@@ -1117,7 +1182,7 @@ func GetKiroClientConfig() KiroClientConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 
-	kiroVersion := "0.11.107"
+	kiroVersion := "0.12.333"
 	if cfg != nil && cfg.KiroVersion != "" {
 		kiroVersion = cfg.KiroVersion
 	}
@@ -1151,4 +1216,86 @@ func defaultSystemVersion() string {
 	default:
 		return "linux#6.6.87"
 	}
+}
+
+// KiroClientSettingsView is the read-only snapshot returned by the admin API
+// for the Kiro Client settings card. BuildHashes merges the built-in defaults
+// (which cannot be removed) with user overrides; Defaults is the built-in set
+// so the UI can mark those rows as non-removable.
+type KiroClientSettingsView struct {
+	KiroVersion   string            `json:"kiroVersion"`
+	SystemVersion string            `json:"systemVersion"`
+	NodeVersion   string            `json:"nodeVersion"`
+	BuildHashes   map[string]string `json:"buildHashes"`
+	Defaults      map[string]string `json:"defaults"`
+}
+
+// GetKiroClientSettings returns the current Kiro client settings for the admin
+// UI. Built-in hash defaults and user overrides are merged; Defaults carries
+// the built-in table verbatim so the UI can display a badge and block removal.
+func GetKiroClientSettings() KiroClientSettingsView {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	merged := make(map[string]string, len(kiroBuildHashes))
+	for k, v := range kiroBuildHashes {
+		merged[k] = v
+	}
+	if cfg != nil {
+		for k, v := range cfg.KiroBuildHashOverrides {
+			merged[k] = v
+		}
+	}
+
+	defs := make(map[string]string, len(kiroBuildHashes))
+	for k, v := range kiroBuildHashes {
+		defs[k] = v
+	}
+
+	return KiroClientSettingsView{
+		KiroVersion:   cfg.KiroVersion,
+		SystemVersion: cfg.SystemVersion,
+		NodeVersion:   cfg.NodeVersion,
+		BuildHashes:   merged,
+		Defaults:      defs,
+	}
+}
+
+// UpdateKiroClientSettings persists the Kiro client settings edited from the
+// admin UI: the three version strings and the user-configured build-hash
+// overrides. Entries whose version already exists in the built-in table are
+// silently dropped (defaults are managed in code, not the UI), so the UI can
+// send the merged map and the built-in entries survive a round-trip unchanged.
+func UpdateKiroClientSettings(kiroVersion, systemVersion, nodeVersion string, overrides map[string]string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	if kiroVersion != "" {
+		cfg.KiroVersion = kiroVersion
+	}
+	if systemVersion != "" {
+		cfg.SystemVersion = systemVersion
+	}
+	if nodeVersion != "" {
+		cfg.NodeVersion = nodeVersion
+	}
+
+	// Filter out entries that match a built-in default — those belong to the
+	// code table, not the user-override map. A nil/empty map removes all overrides.
+	clean := make(map[string]string)
+	for k, v := range overrides {
+		if k == "" {
+			continue
+		}
+		if builtin, ok := kiroBuildHashes[k]; ok && builtin == v {
+			continue
+		}
+		clean[k] = v
+	}
+	if len(clean) == 0 {
+		cfg.KiroBuildHashOverrides = nil
+	} else {
+		cfg.KiroBuildHashOverrides = clean
+	}
+	return Save()
 }

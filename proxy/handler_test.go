@@ -525,3 +525,55 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 		t.Fatalf("expected 1 miss, got %v", cache["misses"])
 	}
 }
+
+// TestKiroClientEndpointRejectsInvalidHash verifies the /admin/api/kiro-client
+// POST handler rejects build hashes that are not 64-character hex strings,
+// since the real Kiro client sends a SHA-256 hash in that exact format.
+func TestKiroClientEndpointRejectsInvalidHash(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	tests := []struct {
+		name       string
+		hash       string
+		wantStatus int
+	}{
+		{"valid 64-hex", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", 200},
+		{"too short", "abcdef1234567890", 400},
+		{"too long", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678901", 400},
+		{"non-hex chars", "ghijkl1234567890abcdef1234567890abcdef1234567890abcdef1234567890", 400},
+		{"uuid format", "550e8400-e29b-41d4-a716-4466554400001234567890abcdef1234567890ab", 400},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]interface{}{
+				"buildHashes": map[string]string{"0.15.0": tc.hash},
+			}
+			bodyJSON, _ := json.Marshal(body)
+			req := httptest.NewRequest(http.MethodPost, "/admin/api/kiro-client", strings.NewReader(string(bodyJSON)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			h.apiUpdateKiroClientConfig(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d: %s", tc.wantStatus, rec.Code, rec.Body.String())
+			}
+			if tc.wantStatus == 400 {
+				var resp map[string]string
+				if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+					t.Fatalf("decode error response: %v", err)
+				}
+				if resp["error"] == "" {
+					t.Fatalf("expected error message in response, got %+v", resp)
+				}
+			}
+		})
+	}
+}

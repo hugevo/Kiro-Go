@@ -409,6 +409,43 @@
           </div>
         </div>
 
+        <!-- Kiro client fingerprint (User-Agent version + build hashes) -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.kiroClient"></span></div>
+          <p class="card-subtitle" data-i18n="settings.kiroClientHint"></p>
+
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="settings.versions"></label>
+            <div class="flex flex-col gap-3">
+              <div>
+                <label class="form-label" data-i18n="settings.kiroVersion"></label>
+                <input type="text" id="kiroVersion" class="form-input" placeholder="0.12.333" />
+                <small class="field-hint-offset" data-i18n="settings.kiroVersionHint"></small>
+              </div>
+              <div>
+                <label class="form-label" data-i18n="settings.systemVersion"></label>
+                <input type="text" id="systemVersion" class="form-input" placeholder="win32#10.0.19045" />
+                <small class="field-hint-offset" data-i18n="settings.systemVersionHint"></small>
+              </div>
+              <div>
+                <label class="form-label" data-i18n="settings.nodeVersion"></label>
+                <input type="text" id="nodeVersion" class="form-input" placeholder="22.22.0" />
+                <small class="field-hint-offset" data-i18n="settings.nodeVersionHint"></small>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group mt-4">
+            <label class="font-semibold pb-2 block" data-i18n="settings.buildHashes"></label>
+            <div id="kiroBuildHashes" class="mb-2"></div>
+            <div class="flex gap-2 flex-wrap items-center">
+              <button class="btn btn-outline btn-sm" id="addBuildHashBtn" data-i18n="settings.addBuildHash"></button>
+              <button class="btn btn-primary btn-sm" id="saveKiroClientBtn"
+                data-i18n="settings.saveKiroClient"></button>
+            </div>
+          </div>
+        </div>
+
         <!-- Statistics reset -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>

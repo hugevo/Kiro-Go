@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	kiroStreamingSDKVersion = "1.0.34"
+	kiroStreamingSDKVersion = "1.0.39"
 	kiroRuntimeSDKVersion   = "1.0.0"
 )
 
@@ -18,7 +18,7 @@ type kiroHeaderValues struct {
 }
 
 func buildStreamingHeaderValues(account *config.Account, host string) kiroHeaderValues {
-	return buildKiroHeaderValues(account, host, "codewhispererstreaming", kiroStreamingSDKVersion, "m/E")
+	return buildKiroHeaderValues(account, host, "codewhispererstreaming", kiroStreamingSDKVersion, "m/N")
 }
 
 func buildRuntimeHeaderValues(account *config.Account, host string) kiroHeaderValues {
@@ -27,9 +27,14 @@ func buildRuntimeHeaderValues(account *config.Account, host string) kiroHeaderVa
 
 func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, mode string) kiroHeaderValues {
 	clientCfg := config.GetKiroClientConfig()
-	machineID := ""
+
+	// The real Kiro client appends a build/content hash (not a per-machine UUID)
+	// after `KiroIDE-<version>`, and that hash is identical across all installs of
+	// the same version. Reproduce that exactly so the User-Agent matches a real
+	// client instead of standing out with a random UUID.
+	hashSuffix := ""
 	if account != nil {
-		machineID = account.MachineId
+		hashSuffix = config.ResolveKiroBuildHash(clientCfg.KiroVersion, account.HashSuffix)
 	}
 
 	userAgent := fmt.Sprintf(
@@ -43,9 +48,9 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 		clientCfg.KiroVersion,
 	)
 	amzUserAgent := fmt.Sprintf("aws-sdk-js/%s KiroIDE-%s", sdkVersion, clientCfg.KiroVersion)
-	if machineID != "" {
-		userAgent += "-" + machineID
-		amzUserAgent += "-" + machineID
+	if hashSuffix != "" {
+		userAgent += "-" + hashSuffix
+		amzUserAgent += "-" + hashSuffix
 	}
 
 	return kiroHeaderValues{

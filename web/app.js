@@ -19,6 +19,11 @@
   let filterStatus = 'all';
   let privacyModeEnabled = true;
   let promptRules = [];
+  // Kiro client fingerprint state (version → build hash). `kiroBuildHashDefaults`
+  // holds the built-in code-table entries (non-removable); `kiroBuildHashes` is
+  // the full merged view (defaults + user overrides) that is rendered and POSTed.
+  let kiroBuildHashes = [];
+  let kiroBuildHashDefaults = {};
   let builderIdSession = '';
   let builderIdPollTimer = null;
   let kiroSsoSession = '';
@@ -1537,7 +1542,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadKiroClientConfig(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -2015,6 +2020,101 @@
   function addPromptRule(type) {
     promptRules.push({ id: 'rule-' + Date.now(), name: '', type, match: '', replace: '', enabled: true });
     renderPromptRules();
+  }
+
+  // Kiro client fingerprint (User-Agent version + build hashes)
+  async function loadKiroClientConfig() {
+    const res = await api('/kiro-client');
+    const d = await res.json();
+    $('kiroVersion').value = d.kiroVersion || '';
+    $('systemVersion').value = d.systemVersion || '';
+    $('nodeVersion').value = d.nodeVersion || '';
+    kiroBuildHashDefaults = d.defaults || {};
+    // Build a sorted list (defaults first so they render at the top), marking
+    // built-in entries so the UI can render a non-removable "default" badge.
+    const list = [];
+    Object.keys(kiroBuildHashDefaults).forEach(ver => {
+      list.push({ version: ver, hash: kiroBuildHashDefaults[ver], isDefault: true });
+    });
+    Object.keys(d.buildHashes || {}).forEach(ver => {
+      if (!kiroBuildHashDefaults[ver]) {
+        list.push({ version: ver, hash: d.buildHashes[ver], isDefault: false });
+      }
+    });
+    kiroBuildHashes = list;
+    renderKiroBuildHashes();
+  }
+  async function saveKiroClientConfig() {
+    // Flatten the rows back into a map for the server. Empty version fields are
+    // dropped so a half-filled "new row" doesn't get saved.
+    const buildHashes = {};
+    let invalidVersion = null;
+    kiroBuildHashes.forEach(row => {
+      if (!row.version || !row.version.trim()) return;
+      // Only validate non-default rows; defaults are managed in code and the
+      // server will drop them anyway during UpdateKiroClientSettings.
+      if (!row.isDefault && !/^[0-9a-f]{64}$/.test(row.hash || '')) {
+        invalidVersion = row.version;
+      }
+      buildHashes[row.version] = row.hash || '';
+    });
+    if (invalidVersion) {
+      toast(t('kiroClient.hashInvalid').replace('{version}', invalidVersion), 'error');
+      return;
+    }
+    const res = await api('/kiro-client', {
+      method: 'POST', body: JSON.stringify({
+        kiroVersion: $('kiroVersion').value || null,
+        systemVersion: $('systemVersion').value || null,
+        nodeVersion: $('nodeVersion').value || null,
+        buildHashes: buildHashes
+      })
+    });
+    const d = await res.json();
+    if (d.success) {
+      toast(t('settings.kiroClientSaved'), 'success');
+      await loadKiroClientConfig();
+    } else {
+      toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+    }
+  }
+  function renderKiroBuildHashes() {
+    const c = $('kiroBuildHashes');
+    if (!c) return;
+    if (!kiroBuildHashes.length) {
+      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('kiroClient.noHashes')) + '</small>';
+      return;
+    }
+    c.innerHTML = kiroBuildHashes.map((row, i) => {
+      const isDefault = row.isDefault;
+      const versionInput = '<div class="rule-field">' +
+        '<label>' + escapeHtml(t('settings.buildHashVersion')) + '</label>' +
+        '<input value="' + escapeAttr(row.version || '') + '" data-hash-idx="' + i + '" data-hash-field="version"' +
+        (isDefault ? ' disabled' : '') + ' />' +
+        '</div>';
+      const hashInput = '<div class="rule-field">' +
+        '<label>' + escapeHtml(t('settings.buildHashValue')) + '</label>' +
+        '<input value="' + escapeAttr(row.hash || '') + '" data-hash-idx="' + i + '" data-hash-field="hash"' +
+        (isDefault ? ' disabled' : '') + ' />' +
+        '</div>';
+      const badge = isDefault
+        ? '<span class="kiro-build-hash-default">' + escapeHtml(t('settings.buildHashDefault')) + '</span>'
+        : '';
+      const removeBtn = isDefault
+        ? ''
+        : '<button class="rule-remove" data-hash-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>';
+      return '<div class="rule-card">' +
+        '<div class="rule-header">' +
+        badge +
+        '<div class="rule-meta" style="flex:1">' + versionInput + hashInput + '</div>' +
+        removeBtn +
+        '</div>' +
+        '</div>';
+    }).join('');
+  }
+  function addBuildHashRow() {
+    kiroBuildHashes.push({ version: '', hash: '', isDefault: false });
+    renderKiroBuildHashes();
   }
 
   // Add-account modal templates
@@ -3015,6 +3115,27 @@
     });
   }
 
+  function bindKiroClientEvents() {
+    $('saveKiroClientBtn').addEventListener('click', saveKiroClientConfig);
+    $('addBuildHashBtn').addEventListener('click', addBuildHashRow);
+
+    $('kiroBuildHashes').addEventListener('input', e => {
+      const idx = e.target.dataset.hashIdx;
+      const field = e.target.dataset.hashField;
+      if (idx != null && field) kiroBuildHashes[parseInt(idx, 10)][field] = e.target.value;
+    });
+    $('kiroBuildHashes').addEventListener('click', e => {
+      const rm = e.target.closest('[data-hash-remove]');
+      if (rm) {
+        const i = parseInt(rm.dataset.hashRemove, 10);
+        if (kiroBuildHashes[i] && !kiroBuildHashes[i].isDefault) {
+          kiroBuildHashes.splice(i, 1);
+          renderKiroBuildHashes();
+        }
+      }
+    });
+  }
+
   function bindModalEvents() {
     $('addModalClose').addEventListener('click', closeModal);
     $('detailModalClose').addEventListener('click', closeDetailModal);
@@ -3291,6 +3412,7 @@
     bindAccountEvents();
     bindSettingsEvents();
     bindPromptFilterEvents();
+    bindKiroClientEvents();
     bindModalEvents();
     bindDetailEvents();
     bindTestEvents();

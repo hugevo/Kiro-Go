@@ -55,6 +55,92 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 	}
 }
 
+func TestResolveKiroBuildHashPrecedence(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	// Test 1: Code default for known version
+	hash := ResolveKiroBuildHash("0.12.333", "")
+	expected := "2ecd375f32fb815800ae42b778607b3a4cb0ef89208f4d12b13080ede8c29795"
+	if hash != expected {
+		t.Errorf("expected code default %q, got %q", expected, hash)
+	}
+
+	// Test 2: Account override (HashSuffix) wins over code default
+	accountOverride := "account-override-hash"
+	hash = ResolveKiroBuildHash("0.12.333", accountOverride)
+	if hash != accountOverride {
+		t.Errorf("expected account override %q, got %q", accountOverride, hash)
+	}
+
+	// Test 3: UI override wins over code default
+	uiOverride := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	if err := UpdateKiroClientSettings("0.12.333", "", "", map[string]string{"0.12.333": uiOverride}); err != nil {
+		t.Fatalf("update kiro client settings: %v", err)
+	}
+	hash = ResolveKiroBuildHash("0.12.333", "")
+	if hash != uiOverride {
+		t.Errorf("expected UI override %q, got %q", uiOverride, hash)
+	}
+
+	// Test 4: Account override wins over UI override
+	hash = ResolveKiroBuildHash("0.12.333", accountOverride)
+	if hash != accountOverride {
+		t.Errorf("expected account override %q over UI override, got %q", accountOverride, hash)
+	}
+
+	// Test 5: Unknown version falls back to sha256 hash
+	unknownHash := ResolveKiroBuildHash("99.99.99", "")
+	if unknownHash == "" {
+		t.Error("expected fallback hash for unknown version, got empty string")
+	}
+	if len(unknownHash) != 64 {
+		t.Errorf("expected 64-char hex fallback, got %d chars: %q", len(unknownHash), unknownHash)
+	}
+}
+
+func TestKiroBuildHashOverridesPersistence(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	// Set overrides
+	overrides := map[string]string{
+		"0.13.0": "aaa111222333444555666777888999000aaabbbcccdddeeefff000111222333",
+		"0.14.0": "bbb111222333444555666777888999000aaabbbcccdddeeefff000111222333",
+	}
+	if err := UpdateKiroClientSettings("0.13.0", "win32#10.0.22631", "22.22.0", overrides); err != nil {
+		t.Fatalf("update settings: %v", err)
+	}
+
+	// Verify in memory
+	settings := GetKiroClientSettings()
+	if settings.KiroVersion != "0.13.0" {
+		t.Errorf("expected KiroVersion 0.13.0, got %q", settings.KiroVersion)
+	}
+	if settings.BuildHashes["0.13.0"] != overrides["0.13.0"] {
+		t.Errorf("expected build hash for 0.13.0, got %q", settings.BuildHashes["0.13.0"])
+	}
+	if settings.BuildHashes["0.14.0"] != overrides["0.14.0"] {
+		t.Errorf("expected build hash for 0.14.0, got %q", settings.BuildHashes["0.14.0"])
+	}
+
+	// Reload from disk and verify persistence
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("reinit config: %v", err)
+	}
+	settings = GetKiroClientSettings()
+	if settings.KiroVersion != "0.13.0" {
+		t.Errorf("after reload: expected KiroVersion 0.13.0, got %q", settings.KiroVersion)
+	}
+	if settings.BuildHashes["0.13.0"] != overrides["0.13.0"] {
+		t.Errorf("after reload: expected build hash for 0.13.0, got %q", settings.BuildHashes["0.13.0"])
+	}
+}
+
 // TestAccountAllowOverageMigration verifies that a config.json from before the
 // upstream-Overages-switch refactor (which carried `allowOverage: true` per
 // account) is migrated into OverageStatus="ENABLED" on first load, and that
