@@ -54,7 +54,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 
 	var toolUses []KiroToolUse
 	var completed bool
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStream(stream, "", &KiroStreamCallback{
 		OnToolUse: func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
 		},
@@ -79,6 +79,70 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamGPT56PreservesAssistantDeltasAndHidesReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "..."}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "..."}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "Answer"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "..."}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "..."}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "the"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hero"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "```"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "go\nfmt.Println(\"ok\")\n"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "```"}),
+	}, nil))
+
+	var content, reasoning string
+	err := parseEventStream(stream, "gpt-5.6-sol", &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				reasoning += text
+				return
+			}
+			content += text
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if reasoning != "" {
+		t.Fatalf("expected hidden GPT-5.6 reasoning to be suppressed, got %q", reasoning)
+	}
+	if want := "Answer......thehero```go\nfmt.Println(\"ok\")\n```"; content != want {
+		t.Fatalf("assistant deltas were altered:\n got %q\nwant %q", content, want)
+	}
+}
+
+func TestParseEventStreamLegacyModelNormalizesSnapshots(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello world"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "think"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "thinking"}),
+	}, nil))
+
+	var content, reasoning string
+	err := parseEventStream(stream, "claude-sonnet-4.5", &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				reasoning += text
+				return
+			}
+			content += text
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if content != "hello world" {
+		t.Fatalf("expected cumulative assistant snapshots to normalize, got %q", content)
+	}
+	if reasoning != "thinking" {
+		t.Fatalf("expected cumulative reasoning snapshots to normalize, got %q", reasoning)
+	}
+}
+
 func TestParseEventStreamNilCallbackIsNoOp(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello"}),
@@ -92,7 +156,7 @@ func TestParseEventStreamNilCallbackIsNoOp(t *testing.T) {
 		}),
 	}, nil))
 
-	if err := parseEventStream(stream, nil); err != nil {
+	if err := parseEventStream(stream, "", nil); err != nil {
 		t.Fatalf("expected nil callback to be a no-op, got %v", err)
 	}
 }
@@ -102,7 +166,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 		"content": "hello",
 	}))
 
-	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
+	if err := parseEventStream(stream, "", &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
 	}
 }

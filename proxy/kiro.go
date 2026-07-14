@@ -400,7 +400,8 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		modelID := currentMessageModelID(payload)
+		err = parseEventStream(resp.Body, modelID, callback)
 		resp.Body.Close()
 		return err
 	}
@@ -421,10 +422,12 @@ func accountEmailForLog(account *config.Account) string {
 // ==================== Event Stream Parsing ====================
 
 // parseEventStream decodes an AWS binary Event Stream response body.
-func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+func parseEventStream(body io.Reader, modelID string, callback *KiroStreamCallback) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
+
+	gpt56Stream := isGPT56Model(modelID)
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
@@ -480,12 +483,21 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				if gpt56Stream {
+					if callback.OnText != nil {
+						callback.OnText(content, false)
+					}
+					continue
+				}
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
 				}
 			}
 		case "reasoningContentEvent":
+			if gpt56Stream {
+				continue
+			}
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
@@ -638,13 +650,16 @@ func isLargeContextModel(model string) bool {
 	return false
 }
 
+func isGPT56Model(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-5.6")
+}
+
 // gptContextTokens returns a known context-window size for GPT models shipped
 // by Kiro, or (0, false) when the model is not a recognized GPT variant.
 // Currently GPT 5.6 (sol/luna/terra, and the bare name) expose a 272K window.
 // Keep this table in sync with what ListAvailableModels reports.
 func gptContextTokens(model string) (int, bool) {
-	m := strings.ToLower(strings.TrimSpace(model))
-	if strings.HasPrefix(m, "gpt-5.6") {
+	if isGPT56Model(model) {
 		return 272_000, true
 	}
 	return 0, false
