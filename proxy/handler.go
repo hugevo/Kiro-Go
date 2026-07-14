@@ -24,16 +24,18 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64   `json:"time"`      // Unix timestamp
-	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
-	Model     string  `json:"model"`     // Requested model
-	AccountID string  `json:"accountId"` // Account used
-	Status    string  `json:"status"`    // "success" or "error"
-	Error     string  `json:"error"`     // Error message (empty on success)
-	ErrorType string  `json:"errorType"` // Error category (empty on success)
-	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
-	Duration  int64   `json:"duration"`  // Request duration in ms
+	Time       int64   `json:"time"`       // Unix timestamp
+	Endpoint   string  `json:"endpoint"`   // claude/openai/responses
+	Model      string  `json:"model"`      // Requested model
+	AccountID  string  `json:"accountId"`  // Account used
+	ClientIP   string  `json:"clientIP"`   // Client IP address
+	ApiKeyName string  `json:"apiKeyName"` // Proxy API key name used (empty when unauthenticated)
+	Status     string  `json:"status"`     // "success" or "error"
+	Error      string  `json:"error"`      // Error message (empty on success)
+	ErrorType  string  `json:"errorType"`  // Error category (empty on success)
+	Tokens     int     `json:"tokens"`     // Total tokens (input+output, 0 on failure)
+	Credits    float64 `json:"credits"`    // Credits consumed (0 on failure)
+	Duration   int64   `json:"duration"`   // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -831,15 +833,17 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromRequest(r)
+	apiKeyName := apiKeyNameForID(apiKeyID)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, clientIP, apiKeyName string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1218,7 +1222,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, err)
+			h.recordFailureWithDetails("claude", model, account.ID, clientIP, apiKeyName, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1261,7 +1265,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1288,7 +1292,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, "", clientIP, apiKeyName, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1361,7 +1365,7 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, clientIP, apiKeyName string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 
@@ -1373,29 +1377,33 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 	errType := classifyError(errMsg)
 
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "error",
-		Error:     errMsg,
-		ErrorType: errType,
+		Time:       time.Now().Unix(),
+		Endpoint:   endpoint,
+		Model:      model,
+		AccountID:  accountID,
+		ClientIP:   clientIP,
+		ApiKeyName: apiKeyName,
+		Status:     "error",
+		Error:      errMsg,
+		ErrorType:  errType,
 	}
 
 	h.appendRequestLog(entry)
 }
 
 // recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+func (h *Handler) recordSuccessLog(endpoint, model, accountID, clientIP, apiKeyName string, tokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "success",
-		Tokens:    tokens,
-		Credits:   credits,
-		Duration:  durationMs,
+		Time:       time.Now().Unix(),
+		Endpoint:   endpoint,
+		Model:      model,
+		AccountID:  accountID,
+		ClientIP:   clientIP,
+		ApiKeyName: apiKeyName,
+		Status:     "success",
+		Tokens:     tokens,
+		Credits:    credits,
+		Duration:   durationMs,
 	}
 
 	h.appendRequestLog(entry)
@@ -1411,6 +1419,42 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 	}
 	h.requestLogs = append(h.requestLogs, entry)
 	h.requestLogsMu.Unlock()
+}
+
+// clientIPFromRequest extracts the client IP address from an HTTP request.
+// It checks X-Forwarded-For, X-Real-IP, and falls back to RemoteAddr.
+func clientIPFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	// X-Forwarded-For may contain multiple IPs; use the first (client) one
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.IndexByte(xff, ','); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	// RemoteAddr includes port (host:port); strip the port
+	addr := r.RemoteAddr
+	if idx := strings.LastIndexByte(addr, ':'); idx >= 0 {
+		return addr[:idx]
+	}
+	return addr
+}
+
+// apiKeyNameForID resolves the display name of a proxy API key entry by its ID.
+// Returns "" when the ID is empty or the entry is not found.
+func apiKeyNameForID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if entry := config.GetApiKeyEntry(id); entry != nil {
+		return entry.Name
+	}
+	return ""
 }
 
 // classifyError categorizes an error message into a type for display.
@@ -1446,7 +1490,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, clientIP, apiKeyName string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1533,7 +1577,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1573,7 +1617,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, "", clientIP, apiKeyName, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1621,15 +1665,17 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromRequest(r)
+	apiKeyName := apiKeyNameForID(apiKeyID)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID, clientIP, apiKeyName string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1949,7 +1995,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, err)
+			h.recordFailureWithDetails("openai", model, account.ID, clientIP, apiKeyName, err)
 			return
 		}
 
@@ -1984,7 +2030,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2019,12 +2065,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, "", clientIP, apiKeyName, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID, clientIP, apiKeyName string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2093,7 +2139,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2107,7 +2153,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, "", clientIP, apiKeyName, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2260,6 +2306,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/auth/apikeys-batch" && r.Method == "POST":
+		h.apiImportApiKeys(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -2394,6 +2442,16 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if account.Region == "" {
 		account.Region = "us-east-1"
+	}
+
+	// Normalize API key accounts: when KiroApiKey or AuthMethod "api_key" / "apikey"
+	// is present, force the canonical shape so refresh is skipped and dispatch works.
+	if account.KiroApiKey != "" || strings.EqualFold(strings.TrimSpace(account.AuthMethod), "api_key") || strings.EqualFold(strings.TrimSpace(account.AuthMethod), "apikey") {
+		account.AuthMethod = "api_key"
+		account.ExpiresAt = 0
+		if account.KiroApiKey != "" {
+			account.AccessToken = account.KiroApiKey
+		}
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -3103,10 +3161,76 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		// userId (account-level in Kiro Account Manager exports) embeds the Azure
 		// tenant, from which tokenEndpoint/issuerUrl/scopes are derived when missing.
 		UserID string `json:"userId"`
+		// API key import: a Kiro API key (no OAuth refresh token needed).
+		KiroApiKey string `json:"kiroApiKey"`
+		Nickname   string `json:"nickname"`
+		Enabled    *bool  `json:"enabled,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// API key import branch: when KiroApiKey is present or authMethod is "api_key" / "apikey",
+	// build the account with no refresh token and skip the OAuth flow entirely.
+	if req.KiroApiKey != "" || strings.EqualFold(strings.TrimSpace(req.AuthMethod), "api_key") || strings.EqualFold(strings.TrimSpace(req.AuthMethod), "apikey") {
+		apiKey := strings.TrimSpace(req.KiroApiKey)
+		if apiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required for api_key authMethod"})
+			return
+		}
+		region := req.Region
+		if region == "" {
+			region = "us-east-1"
+		}
+		id := req.ID
+		if id == "" || config.AccountIDExists(id) {
+			id = auth.GenerateAccountID()
+		}
+		account := config.Account{
+			ID:          id,
+			Email:       req.Email,
+			Nickname:    req.Nickname,
+			AccessToken: apiKey, // mirror so pool/dispatch reads AccessToken unchanged
+			KiroApiKey:  apiKey,
+			AuthMethod:  "api_key",
+			Region:      region,
+			ExpiresAt:   0, // never refresh
+			Enabled:     true,
+			MachineId:   config.GenerateMachineId(),
+		}
+		if req.Enabled != nil {
+			account.Enabled = *req.Enabled
+		}
+		if err := config.AddAccount(account); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// Best-effort refresh of account info (email, usage, subscription).
+		// Swallow errors so import succeeds even if the key is temporarily unreachable.
+		go func(acc config.Account) {
+			info, err := RefreshAccountInfo(&acc)
+			if err != nil {
+				logger.Warnf("[ApiKeyImport] RefreshAccountInfo failed for %s: %v", acc.ID, err)
+				return
+			}
+			_ = config.UpdateAccountInfo(acc.ID, *info)
+			h.pool.Reload()
+			if fetchErr := h.fetchAndCacheAccountModels(&acc); fetchErr != nil {
+				logger.Warnf("[ApiKeyImport] fetchAndCacheAccountModels failed for %s: %v", acc.ID, fetchErr)
+			}
+		}(account)
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"account": map[string]interface{}{
+				"id":    account.ID,
+				"email": account.Email,
+			},
+		})
 		return
 	}
 
@@ -3301,8 +3425,8 @@ var externalIdpAuthMethodAliases = map[string]bool{
 }
 
 // normalizeImportAuthMethod maps a pasted credential JSON's authMethod (plus its
-// clientId/clientSecret/tokenEndpoint) onto one of the three canonical methods
-// ("external_idp" | "idc" | "social"). external_idp MUST be detected before the
+// clientId/clientSecret/tokenEndpoint) onto one of the canonical methods
+// ("external_idp" | "idc" | "social" | "api_key"). external_idp MUST be detected before the
 // clientId+clientSecret→idc inference, because external_idp accounts carry clientId
 // but NO clientSecret, so the old default branch misclassified them as "social" and
 // refresh hit the wrong endpoint.
@@ -3315,6 +3439,8 @@ var externalIdpAuthMethodAliases = map[string]bool{
 func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
 	am := strings.ToLower(strings.TrimSpace(authMethod))
 	switch {
+	case am == "api_key" || am == "apikey":
+		return "api_key"
 	case externalIdpAuthMethodAliases[am]:
 		return "external_idp"
 	case tokenEndpoint != "": // infer when not declared explicitly

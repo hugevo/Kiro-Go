@@ -378,6 +378,11 @@ func ensureRestProfileArn(account *config.Account) error {
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
 		return nil
 	}
+	// API key accounts do not need a profile ARN; the tokentype: API_KEY header is
+	// sufficient for CodeWhisperer to accept the request without one.
+	if account.IsApiKeyCredential() {
+		return nil
+	}
 	profileArn, err := ResolveProfileArn(account)
 	if err != nil {
 		if isProfileArnResolutionSoftError(err) {

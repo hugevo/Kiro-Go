@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,7 +103,8 @@ type Account struct {
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "external_idp" (enterprise SSO, e.g. Azure AD)
+	KiroApiKey   string `json:"kiroApiKey,omitempty"`   // Kiro API key (no OAuth refresh token needed; AuthMethod "api_key")
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), or "api_key" (Kiro API key)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
@@ -173,6 +175,17 @@ type Account struct {
 	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+}
+
+// IsApiKeyCredential reports whether this account uses a Kiro API key (no OAuth
+// refresh token) rather than a standard OIDC / SSO credential. API key accounts
+// never refresh (ExpiresAt == 0) and do not need a profile ARN.
+func (a *Account) IsApiKeyCredential() bool {
+	if a.KiroApiKey != "" {
+		return true
+	}
+	am := strings.ToLower(strings.TrimSpace(a.AuthMethod))
+	return am == "api_key" || am == "apikey"
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -721,6 +734,22 @@ func RefreshTokenExists(refreshToken string) bool {
 	defer cfgLock.RUnlock()
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].RefreshToken == refreshToken {
+			return true
+		}
+	}
+	return false
+}
+
+// KiroApiKeyExists reports whether any account already holds the given Kiro API
+// key. Used by API key bulk import to dedup before spending an upstream refresh.
+func KiroApiKeyExists(apiKey string) bool {
+	if apiKey == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].KiroApiKey == apiKey {
 			return true
 		}
 	}

@@ -751,6 +751,8 @@
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.ip')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.apiKey')) + '</th>' +
       '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
@@ -773,6 +775,8 @@
         '<td>' + escapeHtml(l.endpoint) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
+        '<td>' + escapeHtml(l.clientIP || '-') + '</td>' +
+        '<td>' + escapeHtml(l.apiKeyName || '-') + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
@@ -2125,7 +2129,9 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-key',
+    apikeybatch: 'fa-solid fa-list'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2150,6 +2156,8 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
+    else if (type === 'apikeybatch') modalApiKeyBatch(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2178,6 +2186,8 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('apikey', t('modal.apikeyTitle'), t('modal.apikeyDesc')) +
+      methodCard('apikeybatch', t('modal.apikeyBatchTitle'), t('modal.apikeyBatchDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2521,6 +2531,72 @@
       if (errs > 0) msg += t('sso.importPartial', errs);
       toastPrimary(msg, { duration: 5200 });
       if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apikeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apikeyDesc')) + '</p>' +
+      '<p class="help-block">' + escapeHtml(t('apikey.desc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.key')) + '</label>' +
+      '<input type="password" id="apiKeyInput" placeholder="' + escapeAttr(t('apikey.key')) + '" autocomplete="off" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('accounts.add')) + ' - ' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="apiKeyRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.weight')) + '</label>' +
+      '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apiKeys.formNamePlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
+  }
+  function modalApiKeyBatch(title, body) {
+    title.textContent = t('modal.apikeyBatchTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apikeyBatchDesc')) + '</p>' +
+      '<p class="help-block">' + escapeHtml(t('apikeyBatch.desc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikeyBatch.keys')) + '</label>' +
+      '<textarea id="apiKeyBatchInput" rows="8" placeholder="' + escapeAttr(t('apikeyBatch.keys')) + '"></textarea></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="apiKeyBatchRegion" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBatchBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBatchBtn').addEventListener('click', importApiKeysBatch);
+  }
+  async function importApiKey() {
+    const kiroApiKey = $('apiKeyInput').value.trim();
+    if (!kiroApiKey) return toastWarning(t('apikey.keyRequired'));
+    const region = $('apiKeyRegion').value.trim() || 'us-east-1';
+    const nickname = $('apiKeyNickname').value.trim();
+    const payload = {
+      authMethod: 'api_key',
+      kiroApiKey: kiroApiKey,
+      nickname: nickname,
+      region: region,
+      enabled: true
+    };
+    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('cookie.importSuccess') + ': ' + (d.account?.email || d.account?.id));
+      autoRefreshNewAccount(d.account?.id);
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  async function importApiKeysBatch() {
+    const keys = $('apiKeyBatchInput').value.trim();
+    if (!keys) return toastWarning(t('apikeyBatch.keysRequired'));
+    const region = $('apiKeyBatchRegion').value.trim() || 'us-east-1';
+    const res = await api('/auth/apikeys-batch', { method: 'POST', body: JSON.stringify({ keys, region }) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      let msg = t('sso.importSuccess', d.added || 0);
+      if (d.skipped > 0) msg += t('sso.importPartial', d.skipped);
+      toastPrimary(msg, { duration: 5200 });
+      if (d.results) d.results.filter(r => r.success && r.account?.id).forEach(r => autoRefreshNewAccount(r.account.id));
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
   async function startBuilderIdLogin() {

@@ -61,7 +61,16 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 }
 
 func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kiroHeaderValues) {
-	if account != nil && account.AccessToken != "" {
+	if account != nil && account.IsApiKeyCredential() {
+		// API key accounts: use the raw Kiro API key as the bearer token and declare
+		// the token type so CodeWhisperer accepts it without a profile ARN.
+		if account.KiroApiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+account.KiroApiKey)
+		} else if account.AccessToken != "" {
+			req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+		}
+		req.Header.Set("TokenType", "API_KEY")
+	} else if account != nil && account.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	}
 	req.Header.Set("User-Agent", values.UserAgent)
