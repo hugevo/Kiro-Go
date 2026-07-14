@@ -124,6 +124,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 	actualModel, directive := resolveOpenAIThinkingDirective(req.Model, reasoningEffort, thinkingCfg)
 	openaiReq.Model = actualModel
+	logger.Infof("[Thinking] responses model=%s passthrough=%v resolved=%s", actualModel, thinkingCfg.Passthrough, directive.describe())
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 
@@ -134,6 +135,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	openaiReq.Model = config.MapModelForUpstream(actualModel)
 
 	kiroPayload := OpenAIToKiro(openaiReq, directive)
+	kiroPayload.ThinkingLog = directive.describe()
 
 	respID := generateResponseID()
 
@@ -224,7 +226,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
@@ -246,7 +248,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", clientIP, apiKeyName, lastErr)
+	h.recordFailureWithDetails("responses", model, "", clientIP, apiKeyName, payload.ThinkingLog, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -533,7 +535,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
-			h.recordFailureWithDetails("responses", model, account.ID, clientIP, apiKeyName, err)
+			h.recordFailureWithDetails("responses", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, err)
 			return
 		}
 
@@ -580,7 +582,7 @@ func (h *Handler) handleResponsesStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
@@ -617,7 +619,7 @@ func (h *Handler) handleResponsesStream(
 		})
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", clientIP, apiKeyName, lastErr)
+	h.recordFailureWithDetails("responses", model, "", clientIP, apiKeyName, payload.ThinkingLog, lastErr)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

@@ -82,6 +82,37 @@ func (d ThinkingDirective) Render() string {
 	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
 }
 
+// describe returns a compact, content-free one-line summary of how a request's
+// thinking intent was resolved, for operational logging. It never includes user
+// prompt content — only the resolved mode, budget/effort, and provenance — so it
+// is safe to emit at INFO level. Use this to confirm passthrough is actually
+// preserving a client's budget/effort rather than falling back to the fixed prompt.
+func (d ThinkingDirective) describe() string {
+	source := d.Source
+	if source == "" {
+		source = "none"
+	}
+	if !d.Enabled {
+		if d.Mode == "disabled" {
+			return "off (explicit client disable)"
+		}
+		return "off"
+	}
+	switch d.Mode {
+	case "adaptive":
+		effort := d.Effort
+		if effort == "" {
+			effort = "unset"
+		}
+		return fmt.Sprintf("adaptive effort=%s source=%s", effort, source)
+	case "enabled":
+		if d.BudgetTokens > 0 {
+			return fmt.Sprintf("manual budget=%d source=%s", d.BudgetTokens, source)
+		}
+	}
+	return fmt.Sprintf("fixed budget=%d source=%s", legacyThinkingBudget, source)
+}
+
 // thinkingEffortValues is the accepted soft effort enum shared across Claude
 // output_config.effort, OpenAI reasoning_effort, and Responses reasoning.effort.
 var thinkingEffortValues = map[string]bool{

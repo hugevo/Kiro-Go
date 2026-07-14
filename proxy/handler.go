@@ -36,6 +36,7 @@ type RequestLog struct {
 	Tokens     int     `json:"tokens"`     // Total tokens (input+output, 0 on failure)
 	Credits    float64 `json:"credits"`    // Credits consumed (0 on failure)
 	Duration   int64   `json:"duration"`   // Request duration in ms
+	Thinking   string  `json:"thinking"`   // Resolved thinking directive summary (e.g. "manual budget=4096 source=claude", "off"); content-free
 }
 
 const requestLogsMaxSize = 500
@@ -853,6 +854,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		}
 	}
 	actualModel, directive := resolveClaudeThinkingDirective(req.Model, req.Thinking, claudeEffort, thinkingCfg)
+	logger.Infof("[Thinking] claude model=%s passthrough=%v resolved=%s", actualModel, thinkingCfg.Passthrough, directive.describe())
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, directive)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
@@ -867,6 +869,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, directive)
+	kiroPayload.ThinkingLog = directive.describe()
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -1267,7 +1270,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, clientIP, apiKeyName, err)
+			h.recordFailureWithDetails("claude", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1310,7 +1313,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1337,7 +1340,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", clientIP, apiKeyName, lastErr)
+	h.recordFailureWithDetails("claude", model, "", clientIP, apiKeyName, payload.ThinkingLog, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1410,7 +1413,7 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, clientIP, apiKeyName string, err error) {
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, clientIP, apiKeyName, thinking string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 
@@ -1431,13 +1434,14 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, clientIP,
 		Status:     "error",
 		Error:      errMsg,
 		ErrorType:  errType,
+		Thinking:   thinking,
 	}
 
 	h.appendRequestLog(entry)
 }
 
 // recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID, clientIP, apiKeyName string, tokens int, credits float64, durationMs int64) {
+func (h *Handler) recordSuccessLog(endpoint, model, accountID, clientIP, apiKeyName, thinking string, tokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
 		Time:       time.Now().Unix(),
 		Endpoint:   endpoint,
@@ -1449,6 +1453,7 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID, clientIP, apiKeyN
 		Tokens:     tokens,
 		Credits:    credits,
 		Duration:   durationMs,
+		Thinking:   thinking,
 	}
 
 	h.appendRequestLog(entry)
@@ -1629,7 +1634,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1669,7 +1674,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", clientIP, apiKeyName, lastErr)
+	h.recordFailureWithDetails("claude", model, "", clientIP, apiKeyName, payload.ThinkingLog, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1720,6 +1725,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	actualModel, directive := resolveOpenAIThinkingDirective(req.Model, req.ReasoningEffort, thinkingCfg)
 	req.Model = actualModel
+	logger.Infof("[Thinking] openai model=%s passthrough=%v resolved=%s", actualModel, thinkingCfg.Passthrough, directive.describe())
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	// Model mapping: rewrite the facing model to the upstream destination for
@@ -1729,6 +1735,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = config.MapModelForUpstream(actualModel)
 
 	kiroPayload := OpenAIToKiro(&req, directive)
+	kiroPayload.ThinkingLog = directive.describe()
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	clientIP := clientIPFromRequest(r)
@@ -2068,7 +2075,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, clientIP, apiKeyName, err)
+			h.recordFailureWithDetails("openai", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, err)
 			return
 		}
 
@@ -2103,7 +2110,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2138,7 +2145,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", clientIP, apiKeyName, lastErr)
+	h.recordFailureWithDetails("openai", model, "", clientIP, apiKeyName, payload.ThinkingLog, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2219,7 +2226,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, clientIP, apiKeyName, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, clientIP, apiKeyName, payload.ThinkingLog, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2233,7 +2240,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", clientIP, apiKeyName, lastErr)
+	h.recordFailureWithDetails("openai", model, "", clientIP, apiKeyName, payload.ThinkingLog, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 

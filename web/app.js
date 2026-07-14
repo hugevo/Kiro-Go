@@ -750,6 +750,7 @@
       '<th>' + escapeHtml(t('logs.status')) + '</th>' +
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.thinking')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
       '<th>' + escapeHtml(t('logs.ip')) + '</th>' +
       '<th>' + escapeHtml(t('logs.apiKey')) + '</th>' +
@@ -774,6 +775,7 @@
         '<td>' + statusCell + '</td>' +
         '<td>' + escapeHtml(l.endpoint) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
+        '<td><span class="log-msg" title="' + escapeAttr(l.thinking || '') + '">' + escapeHtml(l.thinking || '-') + '</span></td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
         '<td>' + escapeHtml(l.clientIP || '-') + '</td>' +
         '<td>' + escapeHtml(l.apiKeyName || '-') + '</td>' +

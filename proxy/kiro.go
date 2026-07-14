@@ -163,6 +163,13 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// ThinkingLog is a content-free, one-line summary of how the request's
+	// thinking intent was resolved (mode, budget/effort, source). It rides along
+	// on the payload so the per-request success/error log entry can surface it in
+	// the admin Logs screen without threading a parameter through every handler.
+	// Not serialized to the Kiro API request body.
+	ThinkingLog string `json:"-"`
 }
 
 type KiroUserInputMessage struct {

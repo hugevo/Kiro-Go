@@ -521,6 +521,7 @@
   "logs.statusError": "失败",
   "logs.endpoint": "端点",
   "logs.model": "模型",
+  "logs.thinking": "Thinking",
   "logs.account": "账号",
   "logs.ip": "IP",
   "logs.apiKey": "API 密钥",

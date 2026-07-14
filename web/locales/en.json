@@ -523,6 +523,7 @@
   "logs.statusError": "Failed",
   "logs.endpoint": "Endpoint",
   "logs.model": "Model",
+  "logs.thinking": "Thinking",
   "logs.account": "Account",
   "logs.ip": "IP",
   "logs.apiKey": "API Key",
