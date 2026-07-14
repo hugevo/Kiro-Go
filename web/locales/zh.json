@@ -100,6 +100,8 @@
   "settings.openaiFormat": "OpenAI API 输出格式",
   "settings.claudeFormat": "Claude API 输出格式",
   "settings.noTag": "直接输出 (无标签)",
+  "settings.thinkingPassthrough": "透传客户端 thinking 预算/强度",
+  "settings.thinkingPassthroughHint": "关闭（默认）：启用思考时始终使用固定的 max_thinking_length=200000 指令。开启：将客户端的 Claude thinking budget_tokens、output_config.effort 或 OpenAI reasoning_effort/reasoning.effort 保留为等效的 Kiro 指令；触发后缀仍作为回退。",
   "settings.saveThinking": "保存 Thinking 设置",
   "settings.thinkingSaved": "Thinking 设置已保存",
   "settings.endpointSettings": "Kiro 端点设置",

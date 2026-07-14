@@ -213,3 +213,90 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestThinkingPassthroughDefaultsFalse verifies a fresh config, and a config
+// file with no thinkingPassthrough field, both decode the toggle to false while
+// leaving the existing thinking defaults intact.
+func TestThinkingPassthroughDefaultsFalse(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	got := GetThinkingConfig()
+	if got.Passthrough {
+		t.Fatalf("expected Passthrough to default to false on a fresh config")
+	}
+	if got.Suffix != "-thinking" {
+		t.Fatalf("expected default suffix -thinking, got %q", got.Suffix)
+	}
+	if got.OpenAIFormat != "reasoning_content" {
+		t.Fatalf("expected default openaiFormat reasoning_content, got %q", got.OpenAIFormat)
+	}
+	if got.ClaudeFormat != "thinking" {
+		t.Fatalf("expected default claudeFormat thinking, got %q", got.ClaudeFormat)
+	}
+
+	// A config file that predates the toggle (field absent) must still decode to false.
+	seed := map[string]interface{}{
+		"password":      "p",
+		"port":          8080,
+		"host":          "0.0.0.0",
+		"requireApiKey": false,
+		"thinkingSuffix": "-think",
+	}
+	raw, err := json.MarshalIndent(seed, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(cfgFile, raw, 0600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("reinit config: %v", err)
+	}
+	if GetThinkingConfig().Passthrough {
+		t.Fatalf("expected Passthrough false when field absent from config file")
+	}
+}
+
+// TestThinkingPassthroughRoundTrips verifies the toggle persists true and false
+// across reloads without disturbing the other thinking settings.
+func TestThinkingPassthroughRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	if err := UpdateThinkingConfig("-thinking", "reasoning_content", "thinking", true); err != nil {
+		t.Fatalf("update thinking config: %v", err)
+	}
+	if !GetThinkingConfig().Passthrough {
+		t.Fatalf("expected Passthrough true after update")
+	}
+
+	// Reload from disk and confirm persistence of true.
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("reinit config: %v", err)
+	}
+	got := GetThinkingConfig()
+	if !got.Passthrough {
+		t.Fatalf("expected Passthrough true after reload")
+	}
+	if got.Suffix != "-thinking" || got.OpenAIFormat != "reasoning_content" || got.ClaudeFormat != "thinking" {
+		t.Fatalf("expected existing thinking settings intact, got %+v", got)
+	}
+
+	// Flip back to false and confirm it persists.
+	if err := UpdateThinkingConfig("-thinking", "reasoning_content", "thinking", false); err != nil {
+		t.Fatalf("update thinking config (false): %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("reinit config (false): %v", err)
+	}
+	if GetThinkingConfig().Passthrough {
+		t.Fatalf("expected Passthrough false after reload")
+	}
+}

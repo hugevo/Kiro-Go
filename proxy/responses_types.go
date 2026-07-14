@@ -13,7 +13,14 @@ type ResponsesRequest struct {
 	Store              *bool             `json:"store,omitempty"`
 	Temperature        *float64          `json:"temperature,omitempty"`
 	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
-	Metadata           map[string]string `json:"metadata,omitempty"`
+	Metadata           map[string]string    `json:"metadata,omitempty"`
+	Reasoning          *ResponsesReasoning   `json:"reasoning,omitempty"`
+}
+
+// ResponsesReasoning carries the optional reasoning-effort signal
+// (reasoning.effort). Only consulted when thinking passthrough is enabled.
+type ResponsesReasoning struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ResponsesObject struct {

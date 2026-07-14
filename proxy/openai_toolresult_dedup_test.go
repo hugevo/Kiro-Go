@@ -21,7 +21,7 @@ func TestOpenAIToKiroDoesNotDuplicateToolResultText(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, ThinkingDirective{})
 
 	count := 0
 	for _, h := range payload.ConversationState.History {

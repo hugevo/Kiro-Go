@@ -100,6 +100,42 @@ curl http://localhost:8080/v1/chat/completions \
 
 在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
 
+### 透传客户端 thinking 预算/强度
+
+「设置 - Thinking 模式」中的**透传客户端 thinking 预算/强度**开关控制如何处理客户端请求的预算/强度，**默认关闭**。
+
+- **关闭（默认）：** 向后兼容。只要启用了思考（通过后缀或 `thinking` 请求），就使用固定指令 `max_thinking_length=200000`，并忽略客户端的任何 effort 字段。
+- **开启：** 代理会渲染等效的 Kiro 系统指令而非固定提示，以保留客户端意图。它会读取：
+  - Claude Messages 的 `thinking.type`（`enabled`/`adaptive`/`disabled`）与手动 `thinking.budget_tokens`
+  - Claude Messages 的 `output_config.effort`
+  - OpenAI Chat Completions 的 `reasoning_effort`
+  - OpenAI Responses 的 `reasoning.effort`
+
+  可接受的 effort 值：`low`、`medium`、`high`、`xhigh`、`max`。开启时的优先级规则：
+  - 客户端显式配置优先于模型后缀。
+  - Claude 显式 `thinking.type=disabled` 会关闭思考，即使带有 `-thinking` 后缀。
+  - 具体的手动 `budget_tokens` 优先于 effort 信号。
+  - 当没有显式的客户端 thinking/effort 时，触发后缀仍作为回退（保留固定的 `200000` 预算）。
+  - 显式提供的无效 effort 会按协议标准 400 错误拒绝，而不会被静默降级。
+
+请求示例（开启）：
+
+```jsonc
+// Claude Messages —— 精确保留手动预算
+{"model":"claude-sonnet-4.5","max_tokens":8192,"thinking":{"type":"enabled","budget_tokens":4096},"messages":[...]}
+
+// Claude Messages —— 自适应强度
+{"model":"claude-sonnet-4.5","thinking":{"type":"adaptive"},"output_config":{"effort":"high"},"messages":[...]}
+
+// OpenAI Chat Completions
+{"model":"claude-sonnet-4.5","reasoning_effort":"medium","messages":[...]}
+
+// OpenAI Responses
+{"model":"claude-sonnet-4.5","reasoning":{"effort":"high"},"input":[...]}
+```
+
+这是**通过 Kiro 兼容系统指令实现的语义透传**，而非向 Kiro 原生推理字段的原始 JSON 转发。Anthropic 原生 effort 可能影响更广泛的生成与工具行为；代理会通过 Kiro 中可用的指令保留请求的信号，但不保证等效的上游强制执行。
+
 ## 出站代理
 
 可在管理面板「设置 - 出站代理设置」中配置代理。支持 SOCKS5 和 HTTP 代理。

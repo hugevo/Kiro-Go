@@ -1009,6 +1009,15 @@
                         <option value="reasoning_content" data-i18n="settings.noTag"></option>
                     </select>
                 </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:10px">
+                        <label class="switch"><input type="checkbox" id="thinkingPassthrough"><span
+                                class="slider"></span></label>
+                        <span data-i18n="settings.thinkingPassthrough"></span>
+                    </label>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
+                        data-i18n="settings.thinkingPassthroughHint"></small>
+                </div>
                 <button class="btn btn-primary" onclick="saveThinkingConfig()"
                     data-i18n="settings.saveThinking"></button>
             </div>
@@ -1225,6 +1234,8 @@
                 'settings.openaiFormat': 'OpenAI API 输出格式',
                 'settings.claudeFormat': 'Claude API 输出格式',
                 'settings.noTag': '直接输出 (无标签)',
+                'settings.thinkingPassthrough': '透传客户端 thinking 预算/强度',
+                'settings.thinkingPassthroughHint': '关闭（默认）：启用思考时始终使用固定的 max_thinking_length=200000 指令。开启：将客户端的 Claude thinking budget_tokens、output_config.effort 或 OpenAI reasoning_effort/reasoning.effort 保留为等效的 Kiro 指令；触发后缀仍作为回退。',
                 'settings.saveThinking': '保存 Thinking 设置',
                 'settings.thinkingSaved': 'Thinking 设置已保存',
                 'settings.endpointSettings': 'Kiro 端点设置',
@@ -1510,6 +1521,8 @@
                 'settings.openaiFormat': 'OpenAI API Output Format',
                 'settings.claudeFormat': 'Claude API Output Format',
                 'settings.noTag': 'Direct output (no tag)',
+                'settings.thinkingPassthrough': 'Passthrough client thinking budget/effort',
+                'settings.thinkingPassthroughHint': 'Off (default): enabling thinking always uses the fixed max_thinking_length=200000 directive. On: preserves a client\'s Claude thinking budget_tokens, output_config.effort, or OpenAI reasoning_effort/reasoning.effort as equivalent Kiro directives; the trigger suffix stays a fallback.',
                 'settings.saveThinking': 'Save Thinking Settings',
                 'settings.thinkingSaved': 'Thinking settings saved',
                 'settings.endpointSettings': 'Kiro Endpoint Settings',
@@ -2485,11 +2498,12 @@
             document.getElementById('thinkingSuffix').value = d.suffix || '-thinking';
             document.getElementById('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
             document.getElementById('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
+            document.getElementById('thinkingPassthrough').checked = d.thinkingPassthrough === true;
         }
         async function saveThinkingConfig() {
             const res = await fetch('/admin/api/thinking', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ suffix: document.getElementById('thinkingSuffix').value || '-thinking', openaiFormat: document.getElementById('openaiThinkingFormat').value, claudeFormat: document.getElementById('claudeThinkingFormat').value })
+                body: JSON.stringify({ suffix: document.getElementById('thinkingSuffix').value || '-thinking', openaiFormat: document.getElementById('openaiThinkingFormat').value, claudeFormat: document.getElementById('claudeThinkingFormat').value, thinkingPassthrough: document.getElementById('thinkingPassthrough').checked })
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.thinkingSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }

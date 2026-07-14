@@ -100,6 +100,8 @@
   "settings.openaiFormat": "OpenAI API Output Format",
   "settings.claudeFormat": "Claude API Output Format",
   "settings.noTag": "Direct output (no tag)",
+  "settings.thinkingPassthrough": "Passthrough client thinking budget/effort",
+  "settings.thinkingPassthroughHint": "Off (default): enabling thinking always uses the fixed max_thinking_length=200000 directive. On: preserves a client's Claude thinking budget_tokens, output_config.effort, or OpenAI reasoning_effort/reasoning.effort as equivalent Kiro directives; the trigger suffix stays a fallback.",
   "settings.saveThinking": "Save Thinking Settings",
   "settings.thinkingSaved": "Thinking settings saved",
   "settings.endpointSettings": "Kiro Endpoint Settings",

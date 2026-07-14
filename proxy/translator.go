@@ -42,6 +42,127 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+// legacyThinkingBudget is the fixed max_thinking_length rendered when thinking is
+// enabled via the model suffix or an Anthropic thinking request without an
+// explicit passthrough budget. Preserves the historical fixed behavior.
+const legacyThinkingBudget = 200000
+
+// ThinkingDirective is the request-scoped, normalized representation of a
+// client's thinking/reasoning intent. It replaces the translator-facing boolean
+// so a single resolved value drives system-prompt rendering, token accounting,
+// and cache profiling consistently. It carries no process-global state.
+type ThinkingDirective struct {
+	Enabled      bool   // whether Kiro thinking directives are generated
+	Explicit     bool   // true when the client set thinking/effort; false for suffix fallback
+	Mode         string // "enabled" (manual budget), "adaptive" (effort), "disabled", or "" (legacy)
+	BudgetTokens int    // preserved manual budget when Mode == "enabled"
+	Effort       string // preserved soft effort when Mode == "adaptive"
+	Source       string // resolution provenance for tests/debugging; not global state
+}
+
+// Render returns the Kiro system directive block for this directive, or "" when
+// no thinking directive should be generated. The legacy/suffix-fallback path
+// renders exactly the historical ThinkingModePrompt so passthrough-OFF behavior
+// is byte-for-byte compatible.
+func (d ThinkingDirective) Render() string {
+	if !d.Enabled {
+		return ""
+	}
+	if d.Mode == "adaptive" {
+		effort := strings.ToLower(strings.TrimSpace(d.Effort))
+		if effort != "" {
+			return fmt.Sprintf("<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>%s</thinking_effort>", effort)
+		}
+		return "<thinking_mode>adaptive</thinking_mode>"
+	}
+	budget := d.BudgetTokens
+	if budget <= 0 {
+		budget = legacyThinkingBudget
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
+}
+
+// thinkingEffortValues is the accepted soft effort enum shared across Claude
+// output_config.effort, OpenAI reasoning_effort, and Responses reasoning.effort.
+var thinkingEffortValues = map[string]bool{
+	"low":    true,
+	"medium": true,
+	"high":   true,
+	"xhigh":  true,
+	"max":    true,
+}
+
+func isValidThinkingEffort(effort string) bool {
+	return thinkingEffortValues[strings.ToLower(strings.TrimSpace(effort))]
+}
+
+// validateThinkingEffort returns a non-empty error message when a non-empty
+// effort value is outside the accepted enum. An omitted effort is not an error.
+func validateThinkingEffort(effort string) string {
+	if strings.TrimSpace(effort) == "" {
+		return ""
+	}
+	if !isValidThinkingEffort(effort) {
+		return "reasoning effort must be one of: low, medium, high, xhigh, max"
+	}
+	return ""
+}
+
+// resolveClaudeThinkingDirective normalizes a Claude Messages request's thinking
+// intent into a single ThinkingDirective, honoring the passthrough toggle.
+// When OFF, it reproduces the legacy boolean behavior (fixed directive). When
+// ON, explicit client configuration takes precedence over the model suffix.
+func resolveClaudeThinkingDirective(model string, thinkingCfg *ClaudeThinkingConfig, effort string, cfg config.ThinkingConfig) (string, ThinkingDirective) {
+	actualModel, suffixThinking := ParseModelAndThinking(model, cfg.Suffix)
+
+	if !cfg.Passthrough {
+		enabled := suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+		return actualModel, ThinkingDirective{Enabled: enabled}
+	}
+
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if thinkingCfg != nil {
+		switch strings.ToLower(strings.TrimSpace(thinkingCfg.Type)) {
+		case "disabled":
+			// Explicit disabled overrides the suffix.
+			return actualModel, ThinkingDirective{Explicit: true, Mode: "disabled", Source: "claude"}
+		case "enabled":
+			// Manual budget takes precedence over any effort signal.
+			return actualModel, ThinkingDirective{Enabled: true, Explicit: true, Mode: "enabled", BudgetTokens: thinkingCfg.BudgetTokens, Source: "claude"}
+		case "adaptive":
+			return actualModel, ThinkingDirective{Enabled: true, Explicit: true, Mode: "adaptive", Effort: effort, Source: "claude"}
+		}
+	}
+	if effort != "" {
+		return actualModel, ThinkingDirective{Enabled: true, Explicit: true, Mode: "adaptive", Effort: effort, Source: "claude-effort"}
+	}
+	if suffixThinking {
+		return actualModel, ThinkingDirective{Enabled: true, Explicit: false, Mode: "enabled", Source: "suffix"}
+	}
+	return actualModel, ThinkingDirective{}
+}
+
+// resolveOpenAIThinkingDirective normalizes an OpenAI Chat Completions / Responses
+// request's thinking intent (reasoning_effort / reasoning.effort) into a single
+// ThinkingDirective, honoring the passthrough toggle. When OFF, only the suffix
+// enables the fixed directive and effort is ignored.
+func resolveOpenAIThinkingDirective(model, effort string, cfg config.ThinkingConfig) (string, ThinkingDirective) {
+	actualModel, suffixThinking := ParseModelAndThinking(model, cfg.Suffix)
+
+	if !cfg.Passthrough {
+		return actualModel, ThinkingDirective{Enabled: suffixThinking}
+	}
+
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort != "" {
+		return actualModel, ThinkingDirective{Enabled: true, Explicit: true, Mode: "adaptive", Effort: effort, Source: "openai-effort"}
+	}
+	if suffixThinking {
+		return actualModel, ThinkingDirective{Enabled: true, Explicit: false, Mode: "enabled", Source: "suffix"}
+	}
+	return actualModel, ThinkingDirective{}
+}
+
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -120,22 +241,29 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Model        string                `json:"model"`
+	Messages     []ClaudeMessage       `json:"messages"`
+	MaxTokens    int                   `json:"max_tokens"`
+	Temperature  float64               `json:"temperature,omitempty"`
+	TopP         float64               `json:"top_p,omitempty"`
+	Stream       bool                  `json:"stream,omitempty"`
+	System       interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking     *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
+	Tools        []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice   interface{}           `json:"tool_choice,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 	Display      string `json:"display,omitempty"`
+}
+
+// ClaudeOutputConfig carries the optional reasoning-effort signal
+// (output_config.effort). Only consulted when thinking passthrough is enabled.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -196,12 +324,12 @@ type ClaudeUsage struct {
 
 const maxToolDescLen = 10237
 
-func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+func ClaudeToKiro(req *ClaudeRequest, directive ThinkingDirective) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, directive)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -354,16 +482,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}, directive ThinkingDirective) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
+	block := directive.Render()
+	if block == "" {
 		return systemPrompt
 	}
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return block
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return block + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -535,20 +664,19 @@ func collapseBlankLines(s string) string {
 	return strings.Join(out, "\n")
 }
 
-func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeRequest {
+func cloneClaudeRequestForThinking(req *ClaudeRequest, directive ThinkingDirective) *ClaudeRequest {
 	if req == nil {
 		return nil
 	}
 
 	cloned := *req
-	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+	if rendered := directive.Render(); rendered != "" {
+		cloned.System = prependThinkingSystem(req.System, rendered)
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+func prependThinkingSystem(system interface{}, thinkingText string) interface{} {
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}
@@ -987,13 +1115,14 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []OpenAIMessage `json:"messages"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	Temperature     float64         `json:"temperature,omitempty"`
+	TopP            float64         `json:"top_p,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	Tools           []OpenAITool    `json:"tools,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // soft effort signal preserved when thinking passthrough is ON
 }
 
 type OpenAIMessage struct {
@@ -1092,7 +1221,7 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
-func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+func OpenAIToKiro(req *OpenAIRequest, directive ThinkingDirective) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -1111,8 +1240,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+	if block := directive.Render(); block != "" {
+		systemPrompt = block + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息

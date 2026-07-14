@@ -261,6 +261,7 @@ type Config struct {
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
+	ThinkingPassthrough  bool   `json:"thinkingPassthrough,omitempty"`  // When true, preserve client thinking budget/effort via Kiro directives instead of the fixed prompt (default: false)
 
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
@@ -1144,6 +1145,7 @@ type ThinkingConfig struct {
 	Suffix       string `json:"suffix"`       // Model name suffix that triggers thinking mode
 	OpenAIFormat string `json:"openaiFormat"` // Output format for OpenAI-compatible responses
 	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
+	Passthrough  bool   `json:"passthrough"`  // When true, preserve client thinking budget/effort via Kiro directives instead of the fixed prompt
 }
 
 // GetThinkingConfig 获取 thinking 配置
@@ -1168,16 +1170,18 @@ func GetThinkingConfig() ThinkingConfig {
 		Suffix:       suffix,
 		OpenAIFormat: openaiFormat,
 		ClaudeFormat: claudeFormat,
+		Passthrough:  cfg.ThinkingPassthrough,
 	}
 }
 
 // UpdateThinkingConfig 更新 thinking 配置
-func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
+func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string, passthrough bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	cfg.ThinkingPassthrough = passthrough
 	return Save()
 }
 

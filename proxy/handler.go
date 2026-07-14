@@ -787,9 +787,19 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	var claudeEffort string
+	if req.OutputConfig != nil {
+		claudeEffort = req.OutputConfig.Effort
+	}
+	if thinkingCfg.Passthrough {
+		if msg := validateThinkingEffort(claudeEffort); msg != "" {
+			h.sendClaudeError(w, 400, "invalid_request_error", msg)
+			return
+		}
+	}
+	actualModel, directive := resolveClaudeThinkingDirective(req.Model, req.Thinking, claudeEffort, thinkingCfg)
 	req.Model = actualModel
-	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
+	effectiveReq := cloneClaudeRequestForThinking(&req, directive)
 
 	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	if estimatedTokens < 1 {
@@ -830,9 +840,21 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	var claudeEffort string
+	if req.OutputConfig != nil {
+		claudeEffort = req.OutputConfig.Effort
+	}
+	// When passthrough is ON, reject an explicitly supplied invalid effort rather
+	// than silently downgrading it. An omitted effort is not an error.
+	if thinkingCfg.Passthrough {
+		if msg := validateThinkingEffort(claudeEffort); msg != "" {
+			h.sendClaudeError(w, 400, "invalid_request_error", msg)
+			return
+		}
+	}
+	actualModel, directive := resolveClaudeThinkingDirective(req.Model, req.Thinking, claudeEffort, thinkingCfg)
 	req.Model = actualModel
-	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
+	effectiveReq := cloneClaudeRequestForThinking(&req, directive)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
@@ -844,16 +866,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	req.Model = config.MapModelForUpstream(actualModel)
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
+	kiroPayload := ClaudeToKiro(&req, directive)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	clientIP := clientIPFromRequest(r)
 	apiKeyName := apiKeyNameForID(apiKeyID)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, facingModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
+		h.handleClaudeStream(w, kiroPayload, facingModel, directive.Enabled, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, facingModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
+		h.handleClaudeNonStream(w, kiroPayload, facingModel, directive.Enabled, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
 	}
 }
 
@@ -1688,7 +1710,15 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	// When passthrough is ON, reject an explicitly supplied invalid effort rather
+	// than silently downgrading it. An omitted effort is not an error.
+	if thinkingCfg.Passthrough {
+		if msg := validateThinkingEffort(req.ReasoningEffort); msg != "" {
+			h.sendOpenAIError(w, 400, "invalid_request_error", msg)
+			return
+		}
+	}
+	actualModel, directive := resolveOpenAIThinkingDirective(req.Model, req.ReasoningEffort, thinkingCfg)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
@@ -1698,15 +1728,15 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	facingModel := actualModel
 	req.Model = config.MapModelForUpstream(actualModel)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	kiroPayload := OpenAIToKiro(&req, directive)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	clientIP := clientIPFromRequest(r)
 	apiKeyName := apiKeyNameForID(apiKeyID)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
+		h.handleOpenAIStream(w, kiroPayload, facingModel, directive.Enabled, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
+		h.handleOpenAINonStream(w, kiroPayload, facingModel, directive.Enabled, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
 	}
 }
 
@@ -3750,7 +3780,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	// Build a minimal chat payload
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, directive := resolveOpenAIThinkingDirective(req.Model, "", thinkingCfg)
 
 	openaiReq := &OpenAIRequest{
 		Model:     actualModel,
@@ -3758,7 +3788,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		MaxTokens: 5,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq, directive)
 
 	var content string
 	callback := &KiroStreamCallback{
@@ -4015,18 +4045,20 @@ func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.GetThinkingConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"suffix":       cfg.Suffix,
-		"openaiFormat": cfg.OpenAIFormat,
-		"claudeFormat": cfg.ClaudeFormat,
+		"suffix":              cfg.Suffix,
+		"openaiFormat":        cfg.OpenAIFormat,
+		"claudeFormat":        cfg.ClaudeFormat,
+		"thinkingPassthrough": cfg.Passthrough,
 	})
 }
 
 // apiUpdateThinkingConfig 更新 thinking 配置
 func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Suffix       string `json:"suffix"`
-		OpenAIFormat string `json:"openaiFormat"`
-		ClaudeFormat string `json:"claudeFormat"`
+		Suffix              string `json:"suffix"`
+		OpenAIFormat        string `json:"openaiFormat"`
+		ClaudeFormat        string `json:"claudeFormat"`
+		ThinkingPassthrough bool   `json:"thinkingPassthrough"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4047,7 +4079,7 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat); err != nil {
+	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat, req.ThinkingPassthrough); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

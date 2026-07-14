@@ -263,7 +263,7 @@ func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *te
 		System: "Follow the user instructions.",
 	}
 
-	cloned := cloneClaudeRequestForThinking(req, true)
+	cloned := cloneClaudeRequestForThinking(req, ThinkingDirective{Enabled: true})
 	blocks, ok := cloned.System.([]interface{})
 	if !ok {
 		t.Fatalf("expected cloned system prompt to be structured blocks, got %T", cloned.System)
@@ -296,7 +296,7 @@ func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing
 		},
 	}
 
-	cloned := cloneClaudeRequestForThinking(req, true)
+	cloned := cloneClaudeRequestForThinking(req, ThinkingDirective{Enabled: true})
 	blocks, ok := cloned.System.([]interface{})
 	if !ok {
 		t.Fatalf("expected structured system blocks, got %T", cloned.System)
@@ -325,7 +325,7 @@ func TestThinkingPromptAffectsClaudeTokenEstimate(t *testing.T) {
 	}
 
 	baseTokens := estimateClaudeRequestInputTokens(req)
-	thinkingTokens := estimateClaudeRequestInputTokens(cloneClaudeRequestForThinking(req, true))
+	thinkingTokens := estimateClaudeRequestInputTokens(cloneClaudeRequestForThinking(req, ThinkingDirective{Enabled: true}))
 
 	if thinkingTokens <= baseTokens {
 		t.Fatalf("expected thinking tokens (%d) to exceed base tokens (%d)", thinkingTokens, baseTokens)

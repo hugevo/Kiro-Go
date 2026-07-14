@@ -19,7 +19,7 @@ If this project helps you, a Star would mean a lot.
 - **Multiple auth methods** — AWS Builder ID, IAM Identity Center (Enterprise SSO), hosted Kiro sign-in (Google / GitHub / Microsoft 365 / Entra ID / Azure AD), SSO Token paste, credentials JSON paste
 - **Prompt-cache accounting** — Anthropic-style `cache_creation` / `cache_read` token estimation with cross-account sharing, disk persistence, and metrics on `/v1/stats`
 - **Prompt sanitization** — Claude Code system-prompt filter, env-noise strip, boundary-marker strip, custom regex filters
-- **Thinking mode** — via `-thinking` model suffix or a top-level `thinking` config block
+- **Thinking mode** — via `-thinking` model suffix or a top-level `thinking` config block; optional passthrough of client budget/effort
 - **Usage tracking & account import/export**
 - **Outbound proxy** — SOCKS5 / HTTP, hot-reconfigurable without restart
 - **Single static binary** — one external Go dependency (`github.com/google/uuid`), JSON config, one data volume
@@ -116,6 +116,42 @@ curl http://localhost:8080/v1/chat/completions \
 ## Thinking Mode
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
+
+### Passthrough of client thinking budget/effort
+
+A **Passthrough client thinking budget/effort** toggle in Settings - Thinking Mode controls how a client's requested budget/effort is handled. It is **OFF by default**.
+
+- **OFF (default):** Backward-compatible. Whenever thinking is enabled (via the suffix or a `thinking` request), the fixed directive `max_thinking_length=200000` is used and any client effort field is ignored.
+- **ON:** The proxy preserves the client's intent by rendering equivalent Kiro system directives instead of the fixed prompt. It reads:
+  - Claude Messages `thinking.type` (`enabled`/`adaptive`/`disabled`) and manual `thinking.budget_tokens`
+  - Claude Messages `output_config.effort`
+  - OpenAI Chat Completions `reasoning_effort`
+  - OpenAI Responses `reasoning.effort`
+
+  Accepted effort values: `low`, `medium`, `high`, `xhigh`, `max`. Precedence rules when ON:
+  - Explicit client configuration takes precedence over the model suffix.
+  - Explicit Claude `thinking.type=disabled` disables thinking even when the `-thinking` suffix is present.
+  - A concrete manual `budget_tokens` takes precedence over an effort signal.
+  - The trigger suffix remains a fallback when no explicit client thinking/effort is present (retaining the fixed `200000` budget).
+  - An explicitly supplied invalid effort is rejected with the protocol's standard 400 error rather than being silently downgraded.
+
+Request examples (ON):
+
+```jsonc
+// Claude Messages — manual budget preserved exactly
+{"model":"claude-sonnet-4.5","max_tokens":8192,"thinking":{"type":"enabled","budget_tokens":4096},"messages":[...]}
+
+// Claude Messages — adaptive effort
+{"model":"claude-sonnet-4.5","thinking":{"type":"adaptive"},"output_config":{"effort":"high"},"messages":[...]}
+
+// OpenAI Chat Completions
+{"model":"claude-sonnet-4.5","reasoning_effort":"medium","messages":[...]}
+
+// OpenAI Responses
+{"model":"claude-sonnet-4.5","reasoning":{"effort":"high"},"input":[...]}
+```
+
+This is **semantic passthrough via Kiro-compatible system directives**, not raw JSON forwarding to a native Kiro reasoning field. Anthropic's native effort can influence broader generation and tool behavior; the proxy preserves the requested signal through the directive available in Kiro, but equivalent upstream enforcement is not guaranteed.
 
 ## Outbound Proxy
 

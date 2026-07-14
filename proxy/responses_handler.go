@@ -110,7 +110,19 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	var reasoningEffort string
+	if req.Reasoning != nil {
+		reasoningEffort = req.Reasoning.Effort
+	}
+	// When passthrough is ON, reject an explicitly supplied invalid effort rather
+	// than silently downgrading it. An omitted effort is not an error.
+	if thinkingCfg.Passthrough {
+		if msg := validateThinkingEffort(reasoningEffort); msg != "" {
+			h.sendOpenAIError(w, 400, "invalid_request_error", msg)
+			return
+		}
+	}
+	actualModel, directive := resolveOpenAIThinkingDirective(req.Model, reasoningEffort, thinkingCfg)
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
@@ -121,7 +133,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	facingModel := actualModel
 	openaiReq.Model = config.MapModelForUpstream(actualModel)
 
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq, directive)
 
 	respID := generateResponseID()
 
@@ -129,12 +141,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	apiKeyName := apiKeyNameForID(apiKeyID)
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(w, kiroPayload, facingModel, directive.Enabled, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse, clientIP, apiKeyName)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(w, kiroPayload, facingModel, directive.Enabled, estimatedInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse, clientIP, apiKeyName)
 }
 
