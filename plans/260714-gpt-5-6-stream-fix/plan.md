@@ -1,7 +1,7 @@
 ---
 title: "Stabilize GPT-5.6 hidden-reasoning streams"
 description: "Suppress GPT-5.6 hidden-reasoning placeholders and preserve delta chunks without changing existing Claude snapshot normalization."
-status: planned
+status: implemented (pending Go verification)
 priority: P1
 branch: "main"
 tags: [bugfix, backend, streaming, gpt-5.6]
