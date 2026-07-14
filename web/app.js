@@ -1546,7 +1546,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadKiroClientConfig(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadModelMapConfig(), loadKiroClientConfig(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -2041,6 +2041,58 @@
   function addPromptRule(type) {
     promptRules.push({ id: 'rule-' + Date.now(), name: '', type, match: '', replace: '', enabled: true });
     renderPromptRules();
+  }
+
+  // Model mapping (facing -> destination)
+  let modelMaps = [];
+  async function loadModelMapConfig() {
+    const res = await api('/model-mapping');
+    const d = await res.json();
+    modelMaps = d.mappings || [];
+    renderModelMaps();
+  }
+  async function saveModelMapConfig() {
+    const res = await api('/model-mapping', {
+      method: 'POST', body: JSON.stringify({ mappings: modelMaps })
+    });
+    const d = await res.json();
+    if (d.success) toast(t('settings.modelMappingSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  function renderModelMaps() {
+    const c = $('modelMapRules');
+    if (!c) return;
+    if (!modelMaps.length) {
+      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('modelMapping.noRows')) + '</small>';
+      return;
+    }
+    c.innerHTML = modelMaps.map((r, i) => {
+      const maxTokens = r.maxTokens || '';
+      return '<div class="rule-card' + (r.enabled ? '' : ' disabled') + '">' +
+        '<div class="rule-header">' +
+        '<label class="switch"><input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-rule-toggle="' + i + '" /><span class="slider"></span></label>' +
+        '<div class="rule-meta">' +
+        '<span class="rule-type">' + escapeHtml(t('modelMapping.facing')) + '</span>' +
+        '</div>' +
+        '<button class="rule-remove" data-rule-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>' +
+        '</div>' +
+        '<div class="rule-body">' +
+        '<div class="rule-field"><label>' + escapeHtml(t('modelMapping.facing')) + '</label>' +
+        '<input value="' + escapeAttr(r.facing || '') + '" data-rule-idx="' + i + '" data-rule-field="facing" placeholder="' + escapeAttr(t('modelMapping.facingPh')) + '" />' +
+        '</div>' +
+        '<div class="rule-field"><label>' + escapeHtml(t('modelMapping.destination')) + '</label>' +
+        '<input value="' + escapeAttr(r.destination || '') + '" data-rule-idx="' + i + '" data-rule-field="destination" placeholder="' + escapeAttr(t('modelMapping.destinationPh')) + '" />' +
+        '</div>' +
+        '<div class="rule-field"><label>' + escapeHtml(t('modelMapping.maxTokens')) + '</label>' +
+        '<input type="number" min="0" value="' + escapeAttr(String(maxTokens)) + '" data-rule-idx="' + i + '" data-rule-field="maxTokens" placeholder="' + escapeAttr(t('modelMapping.maxTokensPh')) + '" />' +
+        '</div>' +
+        '</div>' +
+        '</div>';
+    }).join('');
+  }
+  function addModelMapRow() {
+    modelMaps.push({ facing: '', destination: '', maxTokens: 0, enabled: true });
+    renderModelMaps();
   }
 
   // Kiro client fingerprint (User-Agent version + build hashes)
@@ -3208,6 +3260,33 @@
     });
   }
 
+  function bindModelMapEvents() {
+    $('saveModelMapBtn').addEventListener('click', saveModelMapConfig);
+    $('addModelMapBtn').addEventListener('click', addModelMapRow);
+
+    $('modelMapRules').addEventListener('input', e => {
+      const idx = e.target.dataset.ruleIdx;
+      const field = e.target.dataset.ruleField;
+      if (idx == null || field == null) return;
+      if (field === 'maxTokens') {
+        const n = parseInt(e.target.value, 10);
+        modelMaps[idx].maxTokens = Number.isFinite(n) && n > 0 ? n : 0;
+      } else {
+        modelMaps[idx][field] = e.target.value;
+      }
+    });
+    $('modelMapRules').addEventListener('change', e => {
+      if (e.target.dataset.ruleToggle != null) {
+        modelMaps[e.target.dataset.ruleToggle].enabled = e.target.checked;
+        renderModelMaps();
+      }
+    });
+    $('modelMapRules').addEventListener('click', e => {
+      const rm = e.target.closest('[data-rule-remove]');
+      if (rm) { modelMaps.splice(parseInt(rm.dataset.ruleRemove, 10), 1); renderModelMaps(); }
+    });
+  }
+
   function bindKiroClientEvents() {
     $('saveKiroClientBtn').addEventListener('click', saveKiroClientConfig);
     $('addBuildHashBtn').addEventListener('click', addBuildHashRow);
@@ -3505,6 +3584,7 @@
     bindAccountEvents();
     bindSettingsEvents();
     bindPromptFilterEvents();
+    bindModelMapEvents();
     bindKiroClientEvents();
     bindModalEvents();
     bindDetailEvents();

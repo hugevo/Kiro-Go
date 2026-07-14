@@ -481,6 +481,15 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
 
+	// 添加用户配置的模型映射 (facing) 及其 thinking 变体
+	for _, m := range config.GetModelMappings() {
+		if !m.Enabled || strings.TrimSpace(m.Facing) == "" {
+			continue
+		}
+		models = append(models, buildModelInfo(m.Facing, "kiro-proxy", true))
+		models = append(models, buildModelInfo(m.Facing+thinkingSuffix, "kiro-proxy", true))
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
@@ -828,6 +837,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
+	// Model mapping: rewrite the facing model to the upstream destination for
+	// the Kiro payload (and therefore routing + context-window sizing). The
+	// facing (actualModel) is still echoed to the client downstream.
+	facingModel := actualModel
+	req.Model = config.MapModelForUpstream(actualModel)
+
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
@@ -836,9 +851,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	clientIP := clientIPFromRequest(r)
 	apiKeyName := apiKeyNameForID(apiKeyID)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
+		h.handleClaudeStream(w, kiroPayload, facingModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
+		h.handleClaudeNonStream(w, kiroPayload, facingModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP, apiKeyName)
 	}
 }
 
@@ -865,6 +880,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
+	// Routing + context-window sizing use the destination model carried in the
+	// payload (what actually goes upstream); `model` here is the facing echoed
+	// to the client.
+	routeModel := currentMessageModelID(payload)
+	if routeModel == "" {
+		routeModel = model
+	}
+
 	ensureMessageStart := func() {
 		if messageStarted {
 			return
@@ -886,7 +909,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelExcluding(routeModel, excluded)
 		if account == nil {
 			break
 		}
@@ -1210,7 +1233,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSizeForModel(routeModel)) / 100.0)
 			},
 		}
 
@@ -1495,8 +1518,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	var lastErr error
 	reqStart := time.Now()
 
+	// Routing + context-window sizing use the destination model carried in the
+	// payload; `model` here is the facing echoed to the client.
+	routeModel := currentMessageModelID(payload)
+	if routeModel == "" {
+		routeModel = model
+	}
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelExcluding(routeModel, excluded)
 		if account == nil {
 			break
 		}
@@ -1534,7 +1564,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSizeForModel(routeModel)) / 100.0)
 			},
 		}
 
@@ -1662,15 +1692,21 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
+	// Model mapping: rewrite the facing model to the upstream destination for
+	// the Kiro payload (routing + context-window sizing). The facing
+	// (actualModel) is still echoed to the client downstream.
+	facingModel := actualModel
+	req.Model = config.MapModelForUpstream(actualModel)
+
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	clientIP := clientIPFromRequest(r)
 	apiKeyName := apiKeyNameForID(apiKeyID)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
+		h.handleOpenAIStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
+		h.handleOpenAINonStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens, apiKeyID, clientIP, apiKeyName)
 	}
 }
 
@@ -1694,8 +1730,15 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	var lastErr error
 	reqStart := time.Now()
 
+	// Routing + context-window sizing use the destination model carried in the
+	// payload; `model` here is the facing echoed to the client.
+	routeModel := currentMessageModelID(payload)
+	if routeModel == "" {
+		routeModel = model
+	}
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelExcluding(routeModel, excluded)
 		if account == nil {
 			break
 		}
@@ -1983,7 +2026,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSizeForModel(routeModel)) / 100.0)
 			},
 		}
 
@@ -2075,8 +2118,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	var lastErr error
 	reqStart := time.Now()
 
+	// Routing + context-window sizing use the destination model carried in the
+	// payload; `model` here is the facing echoed to the client.
+	routeModel := currentMessageModelID(payload)
+	if routeModel == "" {
+		routeModel = model
+	}
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelExcluding(routeModel, excluded)
 		if account == nil {
 			break
 		}
@@ -2106,7 +2156,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSizeForModel(routeModel)) / 100.0)
 			},
 		}
 
@@ -2340,6 +2390,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
 		h.apiUpdatePromptFilter(w, r)
+	case path == "/model-mapping" && r.Method == "GET":
+		h.apiGetModelMapping(w, r)
+	case path == "/model-mapping" && r.Method == "POST":
+		h.apiUpdateModelMapping(w, r)
 	case path == "/kiro-client" && r.Method == "GET":
 		h.apiGetKiroClientConfig(w, r)
 	case path == "/kiro-client" && r.Method == "POST":
@@ -3525,6 +3579,62 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 		rules = *req.Rules
 	}
 	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) apiGetModelMapping(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{"mappings": config.GetModelMappings()})
+}
+
+// apiUpdateModelMapping replaces the whole model-mapping list. Validates each
+// entry (non-empty facing/destination, no duplicate facings, non-negative
+// MaxTokens) and assigns IDs to entries missing one before persisting.
+func (h *Handler) apiUpdateModelMapping(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mappings []config.ModelMapping `json:"mappings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	cleaned := make([]config.ModelMapping, 0, len(req.Mappings))
+	seenFacing := make(map[string]bool, len(req.Mappings))
+	for _, m := range req.Mappings {
+		facing := strings.TrimSpace(m.Facing)
+		destination := strings.TrimSpace(m.Destination)
+		if facing == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "facing model must not be empty"})
+			return
+		}
+		if destination == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "destination model must not be empty for facing " + facing})
+			return
+		}
+		key := strings.ToLower(facing)
+		if seenFacing[key] {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "duplicate facing model: " + facing})
+			return
+		}
+		seenFacing[key] = true
+
+		if m.MaxTokens < 0 {
+			m.MaxTokens = 0
+		}
+		m.Facing = facing
+		m.Destination = destination
+		cleaned = append(cleaned, m)
+	}
+
+	if err := config.UpdateModelMappings(cleaned); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

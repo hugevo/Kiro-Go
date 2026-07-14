@@ -114,6 +114,13 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
+
+	// Model mapping: rewrite the facing model to the upstream destination for
+	// the Kiro payload (routing + context-window sizing). The facing
+	// (actualModel) is still echoed to the client downstream.
+	facingModel := actualModel
+	openaiReq.Model = config.MapModelForUpstream(actualModel)
+
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	respID := generateResponseID()
@@ -122,12 +129,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	apiKeyName := apiKeyNameForID(apiKeyID)
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse, clientIP, apiKeyName)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(w, kiroPayload, facingModel, thinking, estimatedInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse, clientIP, apiKeyName)
 }
 
@@ -141,8 +148,15 @@ func (h *Handler) handleResponsesNonStream(
 	var lastErr error
 	reqStart := time.Now()
 
+	// Routing + context-window sizing use the destination model carried in the
+	// payload; `model` here is the facing echoed to the client.
+	routeModel := currentMessageModelID(payload)
+	if routeModel == "" {
+		routeModel = model
+	}
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelExcluding(routeModel, excluded)
 		if account == nil {
 			break
 		}
@@ -171,7 +185,7 @@ func (h *Handler) handleResponsesNonStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSizeForModel(routeModel)) / 100.0)
 			},
 		}
 
@@ -328,8 +342,15 @@ func (h *Handler) handleResponsesStream(
 	responseStarted := false
 	reqStart := time.Now()
 
+	// Routing + context-window sizing use the destination model carried in the
+	// payload; `model` here is the facing echoed to the client.
+	routeModel := currentMessageModelID(payload)
+	if routeModel == "" {
+		routeModel = model
+	}
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelExcluding(routeModel, excluded)
 		if account == nil {
 			break
 		}
@@ -477,7 +498,7 @@ func (h *Handler) handleResponsesStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSizeForModel(routeModel)) / 100.0)
 			},
 		}
 
@@ -500,7 +521,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
-				h.recordFailureWithDetails("responses", model, account.ID, clientIP, apiKeyName, err)
+			h.recordFailureWithDetails("responses", model, account.ID, clientIP, apiKeyName, err)
 			return
 		}
 

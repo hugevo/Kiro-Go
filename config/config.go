@@ -200,6 +200,20 @@ type PromptFilterRule struct {
 	Enabled bool   `json:"enabled"`           // Whether this rule is active
 }
 
+// ModelMapping defines a dynamic model alias: a facing name clients see in
+// /v1/models and send, and the destination model actually forwarded to the
+// upstream Kiro provider. MaxTokens overrides the context-window size used
+// for token accounting on that destination; 0 means "use built-in tables".
+// Mapping is single-step (A→B does not chain through B→C) and applied after
+// the thinking-suffix is stripped.
+type ModelMapping struct {
+	ID          string `json:"id"`                  // Unique rule identifier
+	Facing      string `json:"facing"`              // Public model name clients see and send
+	Destination string `json:"destination"`         // Real upstream model name
+	MaxTokens   int    `json:"maxTokens,omitempty"` // Context-window override (0 = use built-in tables)
+	Enabled     bool   `json:"enabled"`             // Whether this mapping is active
+}
+
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
@@ -241,7 +255,7 @@ type Config struct {
 	// used when the per-account HashSuffix is not set. Used to build the
 	// KiroIDE-<version>-<hash> User-Agent suffix that the real Kiro client sends.
 	KiroBuildHashOverrides map[string]string `json:"kiroBuildHashes,omitempty"`
-	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+	Accounts               []Account         `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -283,6 +297,12 @@ type Config struct {
 
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
+
+	// ModelMappings is a list of dynamic model aliases. When a client requests
+	// the Facing model, it is rewritten to Destination before the request is
+	// forwarded upstream. Each mapping's optional MaxTokens overrides the
+	// context-window size used for token accounting on that destination.
+	ModelMappings []ModelMapping `json:"modelMappings,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -1040,6 +1060,82 @@ func GetPromptFilterRules() []PromptFilterRule {
 	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
 	copy(rules, cfg.PromptFilterRules)
 	return rules
+}
+
+// GetModelMappings returns a copy of the current model-mapping rules.
+func GetModelMappings() []ModelMapping {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	mappings := make([]ModelMapping, len(cfg.ModelMappings))
+	copy(mappings, cfg.ModelMappings)
+	return mappings
+}
+
+// MapModelForUpstream resolves a client-facing model name to the upstream
+// destination when an enabled mapping matches (case-insensitive, trimmed,
+// exact match on Facing). If no enabled mapping matches, the input is
+// returned unchanged. Called on every request hot path.
+func MapModelForUpstream(facing string) string {
+	if facing == "" {
+		return facing
+	}
+	key := strings.ToLower(strings.TrimSpace(facing))
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return facing
+	}
+	for _, m := range cfg.ModelMappings {
+		if !m.Enabled {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(m.Facing)) == key {
+			return m.Destination
+		}
+	}
+	return facing
+}
+
+// GetModelMappingMaxTokens returns the MaxTokens override for the given
+// destination model (case-insensitive, trimmed), or 0 when no enabled
+// mapping targeting that destination defines a positive MaxTokens.
+func GetModelMappingMaxTokens(destination string) int {
+	if destination == "" {
+		return 0
+	}
+	key := strings.ToLower(strings.TrimSpace(destination))
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return 0
+	}
+	for _, m := range cfg.ModelMappings {
+		if !m.Enabled || m.MaxTokens <= 0 {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(m.Destination)) == key {
+			return m.MaxTokens
+		}
+	}
+	return 0
+}
+
+// UpdateModelMappings replaces the full model-mapping list and persists it.
+// Entries missing an ID are assigned one. Callers are expected to have
+// already validated/truncated the entries (see the admin handler).
+func UpdateModelMappings(mappings []ModelMapping) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range mappings {
+		if strings.TrimSpace(mappings[i].ID) == "" {
+			mappings[i].ID = newUUID()
+		}
+	}
+	cfg.ModelMappings = mappings
+	return Save()
 }
 
 // ThinkingConfig holds settings for AI thinking/reasoning mode.

@@ -572,15 +572,34 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 // Per Kiro's ListAvailableModels, the 1M-token context window applies to
 // Claude 4.6 and newer (sonnet-4.6, opus-4.6, opus-4.7, opus-4.8, and future
 // 4.x releases), while 4.5 and earlier (opus-4.5, sonnet-4.5, sonnet-4,
-// haiku-4.5) use a 200K window. This value is used to convert the upstream
+// haiku-4.5) use a 200K window. GPT 5.6 variants (sol, luna, terra) ship with
+// a 272K window. This value is used to convert the upstream
 // contextUsagePercentage into an absolute input-token count that clients rely
 // on to decide when to compact; an undersized window under-reports tokens and
 // prevents clients from compacting in time.
 func getContextWindowSize(model string) int {
+	if n, ok := gptContextTokens(model); ok {
+		return n
+	}
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+// getContextWindowSizeForModel resolves the context window using a 3-tier
+// lookup keyed on the destination (upstream) model name:
+//  1. An enabled model mapping's MaxTokens override (if > 0) — lets operators
+//     set any value for an unfamiliar model (e.g. a new GPT build).
+//  2. The built-in tables (GPT 272K, Claude 200K/1M).
+//  3. Default 200K.
+//
+// When no mapping override applies this behaves identically to getContextWindowSize.
+func getContextWindowSizeForModel(model string) int {
+	if override := config.GetModelMappingMaxTokens(model); override > 0 {
+		return override
+	}
+	return getContextWindowSize(model)
 }
 
 // largeContextMinor matches "claude-<family>-<major>.<minor>" (dot or dash form)
@@ -610,6 +629,18 @@ func isLargeContextModel(model string) bool {
 		}
 	}
 	return false
+}
+
+// gptContextTokens returns a known context-window size for GPT models shipped
+// by Kiro, or (0, false) when the model is not a recognized GPT variant.
+// Currently GPT 5.6 (sol/luna/terra, and the bare name) expose a 272K window.
+// Keep this table in sync with what ListAvailableModels reports.
+func gptContextTokens(model string) (int, bool) {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(m, "gpt-5.6") {
+		return 272_000, true
+	}
+	return 0, false
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
