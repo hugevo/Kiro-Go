@@ -470,6 +470,8 @@
   "apiKeys.actionEdit": "编辑",
   "apiKeys.actionDelete": "删除",
   "apiKeys.actionReset": "重置用量",
+  "apiKeys.actionCopy": "复制 Key",
+  "apiKeys.revealFailed": "获取 API Key 失败",
   "apiKeys.confirmDelete": "确定删除 Key \"{0}\"？",
   "apiKeys.confirmReset": "确定将 \"{0}\" 的用量计数清零？",
   "apiKeys.deleteSuccess": "Key 已删除",

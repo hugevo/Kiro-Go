@@ -472,6 +472,8 @@
   "apiKeys.actionEdit": "Edit",
   "apiKeys.actionDelete": "Delete",
   "apiKeys.actionReset": "Reset Usage",
+  "apiKeys.actionCopy": "Copy Key",
+  "apiKeys.revealFailed": "Failed to retrieve API key",
   "apiKeys.confirmDelete": "Delete key \"{0}\"?",
   "apiKeys.confirmReset": "Reset usage counters for \"{0}\"?",
   "apiKeys.deleteSuccess": "Key deleted",

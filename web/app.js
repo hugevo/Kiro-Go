@@ -1764,6 +1764,7 @@
               '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
               '<span class="slider"></span>' +
             '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="copy" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionCopy')) + '</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
             '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
@@ -1923,6 +1924,21 @@
     }
   }
 
+  async function copyApiKeyEntry(id) {
+    if (!id) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/reveal');
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('apiKeys.revealFailed'));
+      const key = d.key || '';
+      if (!key) throw new Error(t('apiKeys.revealFailed'));
+      await copyText(key);
+      toast(t('apiKeys.copySuccess'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
   function bindApiKeyEvents() {
     const list = $('apiKeysList');
     if (list) {
@@ -1937,6 +1953,7 @@
         if (action === 'edit') openApiKeyModal(entry);
         else if (action === 'delete') deleteApiKeyEntry(id, name);
         else if (action === 'reset') resetApiKeyUsageEntry(id, name);
+        else if (action === 'copy') copyApiKeyEntry(id);
       });
       list.addEventListener('change', e => {
         const cb = e.target.closest('input[data-apikey-action="toggle"]');

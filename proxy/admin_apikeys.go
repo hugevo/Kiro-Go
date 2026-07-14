@@ -59,6 +59,22 @@ func (h *Handler) apiGetApiKey(w http.ResponseWriter, r *http.Request, id string
 	json.NewEncoder(w).Encode(toApiKeyView(*entry))
 }
 
+// apiRevealApiKey returns the cleartext key for a single entry so the admin can
+// copy it from the settings screen. Unlike apiGetApiKey, this exposes the secret.
+func (h *Handler) apiRevealApiKey(w http.ResponseWriter, r *http.Request, id string) {
+	entry := config.GetApiKeyEntry(id)
+	if entry == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "API key not found"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"id":      entry.ID,
+		"key":     entry.Key,
+	})
+}
+
 type apiKeyCreateRequest struct {
 	Name        string  `json:"name,omitempty"`
 	Key         string  `json:"key,omitempty"`
