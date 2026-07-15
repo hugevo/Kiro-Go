@@ -80,8 +80,7 @@ flowchart TD
     KEY -->|no match / over limit| REJ["401/429"]
     KEY -->|ok| EP["endpoint handler<br/>e.g. handleClaudeMessages"]
     ROUTE -->|/admin/api/*| ADM["handleAdminAPI<br/>(handler.go:2183)"]
-    ROUTE -->|/| REDIR["302 redirect to /admin"]
-    ROUTE -->|/admin, /health| STATIC["SPA / static / health"]
+    ROUTE -->|/, /admin, /health| STATIC["SPA / static / health"]
 
     EP --> XLIN["translator -> KiroPayload<br/>system prime + prompt filters +<br/>truncatePayloadToLimit (900KB)"]
     XLIN --> TOK{"ensureValidToken<br/>(handler.go:2139)<br/>within skew=120s?"}

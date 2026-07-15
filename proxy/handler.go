@@ -400,12 +400,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
 
-	// 根路径重定向到管理页面
-	case path == "/":
-		http.Redirect(w, r, "/admin", http.StatusFound)
-
-	// 管理端点
-	case path == "/admin" || path == "/admin/":
+	// 管理端点（根路径直接渲染管理页面）
+	case path == "/" || path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)

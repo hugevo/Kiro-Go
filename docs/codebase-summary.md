@@ -140,7 +140,7 @@ POST /v1/responses
 - `GET /v1/stats` — usage stats (incl. cache metrics)
 - `POST /api/event_logging/batch` — telemetry sink
 
-**Admin/Web** (admin-gated): `GET /admin` (SPA), `/admin/*` static files, `/admin/api/*` (~50 sub-routes), plus `GET /health`. `GET /` redirects (302) to `/admin`.
+**Admin/Web** (admin-gated): `GET /` and `GET /admin` both serve the SPA, `/admin/*` static files, `/admin/api/*` (~50 sub-routes), plus `GET /health`.
 
 See [System Architecture](system-architecture.md) for diagrams and [Project Overview & PDR](project-overview-pdr.md) for the full functional-requirement list.
 
