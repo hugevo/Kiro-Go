@@ -400,6 +400,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
 
+	// 根路径重定向到管理页面
+	case path == "/":
+		http.Redirect(w, r, "/admin", http.StatusFound)
+
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
@@ -409,7 +413,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStaticFile(w, r)
 
 	// 健康检查
-	case path == "/health" || path == "/":
+	case path == "/health":
 		h.handleHealth(w, r)
 
 	// 统计端点（需要 API Key 鉴权）
