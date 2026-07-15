@@ -340,6 +340,11 @@
   "models.refreshAll": "刷新模型",
   "models.confirmRefreshAll": "确定为所有已启用账号刷新模型？",
   "models.refreshAllDone": "模型刷新完成，共 {0} 个模型",
+
+  "health.check": "健康检查",
+  "health.confirm": "探测所有账号，响应正常的自动启用，失效的（鉴权/额度/封禁）自动禁用？",
+  "health.running": "正在检查账号健康状态...",
+  "health.result": "健康检查完成：启用 {0} 个，禁用 {1} 个，未变 {2} 个",
   "export.title": "导出账号",
   "export.selectAll": "全选",
   "export.deselectAll": "取消全选",

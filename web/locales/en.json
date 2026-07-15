@@ -340,6 +340,11 @@
   "models.refreshAll": "Refresh Models",
   "models.confirmRefreshAll": "Refresh models for all enabled accounts?",
   "models.refreshAllDone": "Models refreshed, {0} models available",
+
+  "health.check": "Health Check",
+  "health.confirm": "Probe every account and enable the ones that respond, disable the dead ones (auth/quota/suspended)?",
+  "health.running": "Checking account health...",
+  "health.result": "Health check done: {0} enabled, {1} disabled, {2} unchanged",
   "export.title": "Export Accounts",
   "export.selectAll": "Select All",
   "export.deselectAll": "Deselect All",

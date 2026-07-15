@@ -1227,6 +1227,25 @@
       toast(t('common.failed'), 'error');
     }
   }
+  async function runHealthCheck() {
+    const ok = await confirmAction(t('health.confirm'), {
+      title: t('health.check'),
+      confirmText: t('health.check')
+    });
+    if (!ok) return;
+    const dismiss = toast(t('health.running'), 'info', { duration: 0 });
+    try {
+      const res = await api('/accounts/health-check', { method: 'POST' });
+      const d = await res.json();
+      dismiss();
+      if (!res.ok || !d.success) throw new Error(d.error || t('common.failed'));
+      toast(t('health.result', d.enabled || 0, d.disabled || 0, d.skipped || 0), d.disabled ? 'warning' : 'success');
+      loadAccounts(); loadStats();
+    } catch (e) {
+      dismiss();
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
   async function refreshAccountModels(id) {
     const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
     try {
@@ -3319,6 +3338,7 @@
     });
 
     $('exportBtn').addEventListener('click', showExportModal);
+    $('healthCheckBtn').addEventListener('click', runHealthCheck);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
