@@ -2344,8 +2344,9 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
-	case path == "/accounts/health-check" && r.Method == "POST":
-		h.apiHealthCheckAccounts(w, r)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/health-check") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/health-check")
+		h.apiHealthCheckAccount(w, r, id)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)
@@ -4192,108 +4193,79 @@ func isDeadAccountError(errMsg string) bool {
 		isSuspensionErrorMessage(errMsg)
 }
 
-// apiHealthCheckAccounts POST /admin/api/accounts/health-check
-// Probes every account in parallel with a minimal request. Accounts that reply
-// are enabled (clearing any prior ban); accounts that fail with auth/quota/
-// suspension errors are disabled. Transient failures leave the account untouched.
-func (h *Handler) apiHealthCheckAccounts(w http.ResponseWriter, r *http.Request) {
+// apiHealthCheckAccount POST /admin/api/accounts/{id}/health-check
+// Probes a single account with a minimal request so the frontend can iterate
+// account-by-account and show live progress. On a successful reply the account
+// is enabled (clearing any prior ban); an auth/quota/suspension error disables
+// it; a transient/network error leaves it untouched.
+func (h *Handler) apiHealthCheckAccount(w http.ResponseWriter, r *http.Request, id string) {
 	var req struct {
 		Model string `json:"model"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
 	accounts := config.GetAccounts()
-
-	type outcome struct {
-		enabled  bool // account was (re)enabled after a successful probe
-		disabled bool // account was disabled after a dead-account error
-		skipped  bool // transient error, left untouched
-	}
-
-	var (
-		mu             sync.Mutex
-		enabledCount   int
-		disabledCount  int
-		skippedCount   int
-		reenabledAccts []config.Account // freshly enabled accounts needing a model-cache refresh
-	)
-
-	const maxConcurrent = 5
-	sem := make(chan struct{}, maxConcurrent)
-	var wg sync.WaitGroup
-
+	var account *config.Account
 	for i := range accounts {
-		acc := accounts[i]
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(account config.Account) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			var res outcome
-			err := h.probeAccount(&account, req.Model)
-			switch {
-			case err == nil:
-				// Alive: enable, clearing any prior ban state.
-				wasDisabled := !account.Enabled
-				account.Enabled = true
-				if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
-					account.BanStatus = "ACTIVE"
-					account.BanReason = ""
-					account.BanTime = 0
-				}
-				config.UpdateAccount(account.ID, account)
-				res.enabled = true
-				if wasDisabled && account.AccessToken != "" {
-					mu.Lock()
-					reenabledAccts = append(reenabledAccts, account)
-					mu.Unlock()
-				}
-			case isDeadAccountError(err.Error()):
-				// Dead: disable with a reason describing the failure class.
-				reason := "Health check failed: " + err.Error()
-				config.SetAccountBanStatus(account.ID, "DISABLED", reason)
-				logger.Warnf("[HealthCheck] Disabled %s: %v", account.Email, err)
-				res.disabled = true
-			default:
-				// Transient/network error — leave the account as-is.
-				logger.Warnf("[HealthCheck] Transient probe error for %s (left unchanged): %v", account.Email, err)
-				res.skipped = true
-			}
-
-			mu.Lock()
-			switch {
-			case res.enabled:
-				enabledCount++
-			case res.disabled:
-				disabledCount++
-			case res.skipped:
-				skippedCount++
-			}
-			mu.Unlock()
-		}(acc)
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
 	}
 
-	wg.Wait()
-	h.pool.Reload()
+	err := h.probeAccount(account, req.Model)
+	switch {
+	case err == nil:
+		// Alive: enable, clearing any prior ban state.
+		wasDisabled := !account.Enabled
+		account.Enabled = true
+		if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
+			account.BanStatus = "ACTIVE"
+			account.BanReason = ""
+			account.BanTime = 0
+		}
+		config.UpdateAccount(account.ID, *account)
+		h.pool.Reload()
+		// Warm the model cache when the account flipped from disabled to enabled.
+		if wasDisabled && account.AccessToken != "" {
+			go func(a config.Account) {
+				a.Enabled = true
+				if ferr := h.fetchAndCacheAccountModels(&a); ferr != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for health-check-enabled account %s: %v", a.Email, ferr)
+				}
+			}(*account)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"status":  "enabled",
+		})
 
-	// Warm the model cache for accounts that flipped from disabled to enabled.
-	for _, acc := range reenabledAccts {
-		go func(a config.Account) {
-			a.Enabled = true
-			if err := h.fetchAndCacheAccountModels(&a); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for health-check-enabled account %s: %v", a.Email, err)
-			}
-		}(acc)
+	case isDeadAccountError(err.Error()):
+		// Dead: disable with a reason describing the failure class.
+		reason := "Health check failed: " + err.Error()
+		config.SetAccountBanStatus(account.ID, "DISABLED", reason)
+		h.pool.Reload()
+		logger.Warnf("[HealthCheck] Disabled %s: %v", account.Email, err)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"status":  "disabled",
+			"error":   err.Error(),
+		})
+
+	default:
+		// Transient/network error — leave the account as-is.
+		logger.Warnf("[HealthCheck] Transient probe error for %s (left unchanged): %v", account.Email, err)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"status":  "skipped",
+			"error":   err.Error(),
+		})
 	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":  true,
-		"total":    len(accounts),
-		"enabled":  enabledCount,
-		"disabled": disabledCount,
-		"skipped":  skippedCount,
-	})
 }
 
 // apiRefreshAccount 刷新账户信息（使用量、订阅等）

@@ -37,6 +37,9 @@
   let testModalLoadingModels = false;
   let testModalModelError = false;
   let testModalRunning = false;
+  let healthRows = [];        // [{ id, email, status: 'pending'|'running'|'enabled'|'disabled'|'skipped', detail }]
+  let healthRunning = false;
+  let healthDone = false;
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
@@ -1227,24 +1230,118 @@
       toast(t('common.failed'), 'error');
     }
   }
-  async function runHealthCheck() {
-    const ok = await confirmAction(t('health.confirm'), {
-      title: t('health.check'),
-      confirmText: t('health.check')
-    });
-    if (!ok) return;
-    const dismiss = toast(t('health.running'), 'info', { duration: 0 });
-    try {
-      const res = await api('/accounts/health-check', { method: 'POST' });
-      const d = await res.json();
-      dismiss();
-      if (!res.ok || !d.success) throw new Error(d.error || t('common.failed'));
-      toast(t('health.result', d.enabled || 0, d.disabled || 0, d.skipped || 0), d.disabled ? 'warning' : 'success');
-      loadAccounts(); loadStats();
-    } catch (e) {
-      dismiss();
-      toast((e && e.message) || t('common.failed'), 'error');
+  function openHealthCheck() {
+    healthRunning = false;
+    healthDone = false;
+    healthRows = accountsData.map(a => ({
+      id: a.id,
+      email: getDisplayEmail(a.email, a.id),
+      status: 'pending',
+      detail: ''
+    }));
+    renderHealthModal();
+    openDialog('healthModal');
+  }
+  function closeHealthModal() {
+    if (healthRunning) return; // don't close mid-run
+    closeDialog('healthModal');
+  }
+  function healthStatusLabel(status) {
+    switch (status) {
+      case 'running': return t('health.statusRunning');
+      case 'enabled': return t('health.statusEnabled');
+      case 'disabled': return t('health.statusDisabled');
+      case 'skipped': return t('health.statusSkipped');
+      default: return t('health.statusPending');
     }
+  }
+  function renderHealthModal() {
+    const body = $('healthBody');
+    if (!body) return;
+    const total = healthRows.length;
+    const done = healthRows.filter(r => r.status !== 'pending' && r.status !== 'running').length;
+    const enabled = healthRows.filter(r => r.status === 'enabled').length;
+    const disabled = healthRows.filter(r => r.status === 'disabled').length;
+    const skipped = healthRows.filter(r => r.status === 'skipped').length;
+
+    const rowsHtml = healthRows.length
+      ? healthRows.map(r =>
+        '<div class="health-row health-row--' + escapeAttr(r.status) + '">' +
+        '<span class="health-row-email">' + escapeHtml(r.email) + '</span>' +
+        '<span class="health-row-status health-badge--' + escapeAttr(r.status) + '">' +
+        (r.status === 'running' ? '<span class="health-spinner"></span>' : '') +
+        escapeHtml(healthStatusLabel(r.status)) +
+        '</span>' +
+        (r.detail ? '<span class="health-row-detail">' + escapeHtml(r.detail) + '</span>' : '') +
+        '</div>'
+      ).join('')
+      : '<div class="test-log-empty">' + escapeHtml(t('accounts.empty')) + '</div>';
+
+    const progressText = healthRunning
+      ? t('health.progress', done, total)
+      : healthDone
+        ? t('health.result', enabled, disabled, skipped)
+        : t('health.intro', total);
+
+    const startLabel = healthDone ? t('health.rerun') : t('health.start');
+    const startDisabled = healthRunning || !healthRows.length;
+
+    body.innerHTML =
+      '<p class="health-intro">' + escapeHtml(progressText) + '</p>' +
+      '<div class="health-list">' + rowsHtml + '</div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="healthCancelBtn" type="button" ' + (healthRunning ? 'disabled' : '') + '>' + escapeHtml(t('common.close')) + '</button>' +
+      '<button class="btn btn-primary" id="healthStartBtn" type="button" ' + (startDisabled ? 'disabled' : '') + (healthRunning ? ' aria-busy="true"' : '') + '>' + escapeHtml(startLabel) + '</button>' +
+      '</div>';
+  }
+  async function runHealthCheck() {
+    if (healthRunning || !healthRows.length) return;
+    healthRunning = true;
+    healthDone = false;
+    healthRows.forEach(r => { r.status = 'pending'; r.detail = ''; });
+    renderHealthModal();
+
+    // Probe all accounts concurrently (bounded), each row updates as its own
+    // request resolves. HEALTH_CONCURRENCY caps in-flight probes so we don't
+    // fire one real upstream call per account all at once.
+    const HEALTH_CONCURRENCY = 6;
+    const queue = healthRows.slice();
+    async function probeRow(row) {
+      row.status = 'running';
+      renderHealthModal();
+      try {
+        const res = await api('/accounts/' + row.id + '/health-check', { method: 'POST' });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d.success) {
+          row.status = d.status || 'skipped';
+          row.detail = d.status === 'enabled' ? '' : (d.error || '');
+        } else {
+          row.status = 'skipped';
+          row.detail = d.error || t('common.failed');
+        }
+      } catch (e) {
+        row.status = 'skipped';
+        row.detail = (e && e.message) || t('common.failed');
+      }
+      renderHealthModal();
+    }
+    async function worker() {
+      while (queue.length) {
+        const row = queue.shift();
+        if (!row) return;
+        await probeRow(row);
+      }
+    }
+    const workers = [];
+    for (let i = 0; i < Math.min(HEALTH_CONCURRENCY, healthRows.length); i++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+
+    healthRunning = false;
+    healthDone = true;
+    renderHealthModal();
+    loadAccounts(); loadStats();
   }
   async function refreshAccountModels(id) {
     const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
@@ -3338,7 +3435,7 @@
     });
 
     $('exportBtn').addEventListener('click', showExportModal);
-    $('healthCheckBtn').addEventListener('click', runHealthCheck);
+    $('healthCheckBtn').addEventListener('click', openHealthCheck);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
@@ -3463,12 +3560,14 @@
     $('exportModalClose').addEventListener('click', closeExportModal);
     $('testModalClose').addEventListener('click', closeTestModal);
     $('updateModalClose').addEventListener('click', closeUpdateModal);
+    $('healthModalClose').addEventListener('click', closeHealthModal);
     [
       ['addModal', closeModal],
       ['detailModal', closeDetailModal],
       ['exportModal', closeExportModal],
       ['testModal', closeTestModal],
       ['updateModal', closeUpdateModal],
+      ['healthModal', closeHealthModal],
       ['confirmModal', () => closeConfirm(false)],
     ].forEach(([id, fn]) => bindDialogBackdropClose(id, fn));
 
@@ -3478,6 +3577,11 @@
       const g = e.target.closest('[data-modal-goto]');
       if (g) { showModal(g.dataset.modalGoto); return; }
       if (e.target.dataset.closeAdd) closeModal();
+    });
+
+    $('healthBody').addEventListener('click', e => {
+      if (e.target.closest('#healthCancelBtn')) { closeHealthModal(); return; }
+      if (e.target.closest('#healthStartBtn')) { runHealthCheck(); return; }
     });
   }
 

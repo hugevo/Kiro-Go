@@ -2754,6 +2754,84 @@ img.brand-icon {
   }
 }
 
+/* Health check modal */
+.health-intro {
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  margin: 0 0 0.75rem;
+}
+.health-list {
+  overflow-y: auto;
+  max-height: 22rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+.health-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+  font-size: 0.8125rem;
+}
+.health-row:last-child {
+  border-bottom: none;
+}
+.health-row-email {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.health-row-detail {
+  grid-column: 1 / -1;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  word-break: break-word;
+  line-height: 1.4;
+}
+.health-row-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  white-space: nowrap;
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
+.health-badge--running {
+  background: color-mix(in oklab, var(--info) 18%, transparent);
+  color: var(--info);
+}
+.health-badge--enabled {
+  background: color-mix(in oklab, var(--success) 18%, transparent);
+  color: var(--success);
+}
+.health-badge--disabled {
+  background: color-mix(in oklab, var(--destructive) 18%, transparent);
+  color: var(--destructive);
+}
+.health-spinner {
+  width: 0.6875rem;
+  height: 0.6875rem;
+  border: 2px solid color-mix(in oklab, var(--info) 40%, transparent);
+  border-top-color: var(--info);
+  border-radius: 50%;
+  animation: health-spin 0.7s linear infinite;
+}
+@keyframes health-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Icon buttons */
 .icon-btn {
   display: inline-flex;
